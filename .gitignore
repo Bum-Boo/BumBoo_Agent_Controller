@@ -1,0 +1,38 @@
+# dependencies
+node_modules/
+
+# build output
+dist/
+out/
+release/
+*.zip
+*.exe
+*.dmg
+*.AppImage
+
+# local/runtime config
+controller.config.json
+controller.config.local.json
+*.local.json
+
+# logs and runtime state
+*.log
+logs/
+backups/
+*.pid
+gateway_state.json
+
+# Hermes private/runtime data - never publish user profile data
+.hermes/
+profiles/
+memories/
+cron/output/
+**/.env
+**/audio_cache/
+**/session*.db
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

@@ -1,0 +1,9 @@
+{
+  "distro": "Ubuntu",
+  "dashboardUrl": "http://127.0.0.1:9119",
+  "dashboardTaskName": "Hermes Dashboard 9119",
+  "labRoot": "/home/YOUR_USER/hermes-lab",
+  "hermesHome": "/home/YOUR_USER/.hermes",
+  "hermesCommand": "hermes",
+  "pollMs": 15000
+}
