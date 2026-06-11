@@ -84,7 +84,10 @@ See `controller.config.example.json` for the shape of the config.
 
 ```bash
 npm run build
+npm run pack
 ```
+
+GitHub Actions builds a Windows `win-unpacked` portable app and uploads it as `BumBoo-Agent-Controller-Windows-Portable.zip`. Tag pushes such as `v0.2.0` publish that zip to GitHub Releases.
 
 ## License
 

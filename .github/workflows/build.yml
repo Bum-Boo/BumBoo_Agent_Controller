@@ -19,14 +19,18 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run build
-      - run: npm run dist
+      - run: npm run pack
+      - name: Create portable zip
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "release/win-unpacked/*" -DestinationPath "release/BumBoo-Agent-Controller-Windows-Portable.zip" -Force
       - uses: actions/upload-artifact@v4
         with:
-          name: BumBoo-Agent-Controller-Windows
-          path: release/*
+          name: BumBoo-Agent-Controller-Windows-Portable
+          path: release/BumBoo-Agent-Controller-Windows-Portable.zip
       - name: Publish GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: release/*
+          files: release/BumBoo-Agent-Controller-Windows-Portable.zip
           generate_release_notes: true
