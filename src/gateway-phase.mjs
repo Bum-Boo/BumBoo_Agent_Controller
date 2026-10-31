@@ -51,8 +51,10 @@ export function gatewayToast(action, result, label) {
   const verb = ACTION_LABEL[action] || action;
   if (!result) return { msg: `${label} 게이트웨이 ${verb} 실패: 응답 없음`, tone: 'err' };
   if (result.busy) {
-    const view = PHASE_VIEW[result.phase];
-    return { msg: `${label}: 이미 ${view ? view.label : result.phase} 상태예요`, tone: 'info' };
+    // A busy result can carry a resting phase (an operation reserved the
+    // gateway but has not changed its phase yet): don't claim "already stopped".
+    if (!isTransitional(result.phase)) return { msg: `${label}: 이미 다른 요청을 처리 중이에요`, tone: 'info' };
+    return { msg: `${label}: 이미 ${PHASE_VIEW[result.phase].label} 상태예요`, tone: 'info' };
   }
   if (result.ok) {
     if (action === 'stop') return { msg: `${label} 게이트웨이 정지 확인`, tone: 'info' };

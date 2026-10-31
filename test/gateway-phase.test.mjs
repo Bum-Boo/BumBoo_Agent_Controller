@@ -58,6 +58,10 @@ test('toasts report confirmed outcomes, not requests', () => {
   assert.equal(failed.tone, 'err');
   assert.match(failed.msg, /시작 실패: gateway exited during startup/);
   assert.match(gatewayToast('stop', { ok: false, busy: true, phase: 'starting' }, 'Alpha').msg, /이미 시작 중/);
+  // regression: busy while a restart is still checking state (phase still resting)
+  const busyResting = gatewayToast('start', { ok: false, busy: true, phase: 'stopped' }, 'Alpha').msg;
+  assert.match(busyResting, /처리 중/);
+  assert.doesNotMatch(busyResting, /정지됨/);
   assert.equal(gatewayToast('start', undefined, 'Alpha').tone, 'err');
 });
 
