@@ -36,3 +36,6 @@ cron/output/
 Thumbs.db
 .vscode/
 .idea/
+
+# test harness fakes must keep their Windows names (wsl.exe, powershell.exe)
+!test/harness/**/*.exe

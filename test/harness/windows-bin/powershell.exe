@@ -1,0 +1,42 @@
+#!/usr/bin/env node
+// Fake powershell.exe for the headless harness (put this dir first on PATH).
+// Only the dashboard scheduled task is emulated: Start-ScheduledTask spawns a
+// tiny local HTTP server on FAKE_DASHBOARD_PORT, Stop-ScheduledTask kills it.
+// Everything else (startup shortcut COM calls, power queries) is a no-op that
+// prints nothing, like a command that found nothing.
+
+const fs = require('node:fs');
+const path = require('node:path');
+const { spawn } = require('node:child_process');
+
+const ROOT = process.env.FAKE_WSL_ROOT || '';
+const i = process.argv.indexOf('-Command');
+const command = i >= 0 ? process.argv.slice(i + 1).join(' ') : '';
+const pidFile = path.join(ROOT, 'dashboard.pid');
+
+if (ROOT) fs.appendFileSync(path.join(ROOT, 'powershell.jsonl'), `${JSON.stringify({ at: Date.now(), command })}\n`);
+
+function alive(pid) { if (!pid) return false; try { process.kill(pid, 0); return true; } catch { return false; } }
+function currentPid() { try { return Number(fs.readFileSync(pidFile, 'utf8')); } catch { return 0; } }
+
+if (/Start-ScheduledTask/.test(command)) {
+  if (process.env.FAKE_DASHBOARD_FAIL === '1') {
+    process.stderr.write('Start-ScheduledTask : The system cannot find the file specified.\n');
+    process.exit(1);
+  }
+  if (!alive(currentPid()) && process.env.FAKE_DASHBOARD_PORT) {
+    const child = spawn(process.execPath, [path.join(__dirname, '..', 'dashboard-server.cjs'), process.env.FAKE_DASHBOARD_PORT], { detached: true, stdio: 'ignore' });
+    child.unref();
+    fs.writeFileSync(pidFile, String(child.pid));
+  }
+  process.exit(0);
+}
+
+if (/Stop-ScheduledTask/.test(command)) {
+  const pid = currentPid();
+  if (alive(pid)) { try { process.kill(pid, 'SIGTERM'); } catch { /* gone */ } }
+  try { fs.unlinkSync(pidFile); } catch { /* none */ }
+  process.exit(0);
+}
+
+process.exit(0);

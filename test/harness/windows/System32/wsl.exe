@@ -1,0 +1,124 @@
+#!/usr/bin/env node
+// Fake wsl.exe for the headless harness. main.cjs resolves wsl.exe as
+// %WINDIR%\System32\wsl.exe, so pointing WINDIR at test/harness/windows makes
+// the controller call this script instead of the real one.
+//
+// Emulated behaviour (only what the controller uses):
+//   wsl.exe -l -q | -l -v          UTF-16LE output, like the real binary
+//   wsl.exe -d <distro> -- bash -lc <command>
+//   wsl.exe --terminate <distro> | --shutdown
+//
+// The "Linux side" is this VM: commands run with a clean env whose PATH starts
+// with test/harness/wsl-bin (fake hermes, systemctl) and whose HOME is the
+// synthetic FAKE_WSL_HOME. Windows-side env vars are NOT inherited, like WSL.
+//
+// The controller's comments say wsl.exe strips `$var` / `$(...)` from inline
+// commands before bash sees them (which is why scripts are base64-wrapped).
+// We emulate that by default so a command that silently relies on `$` fails
+// here too. Set FAKE_WSL_KEEP_DOLLAR=1 to disable.
+//
+// Env:
+//   FAKE_WSL_ROOT     state dir (state.json, calls.jsonl)            required
+//   FAKE_WSL_DISTROS  comma separated installed distros (default Ubuntu)
+//   FAKE_WSL_HOME     $HOME inside the fake distro
+//   FAKE_WSL_BIN      dir with fake Linux-side binaries
+
+const fs = require('node:fs');
+const path = require('node:path');
+const { spawn, spawnSync } = require('node:child_process');
+
+const ROOT = process.env.FAKE_WSL_ROOT;
+if (!ROOT) { process.stderr.write('FAKE_WSL_ROOT not set\n'); process.exit(1); }
+const STATE = path.join(ROOT, 'state.json');
+const distros = (process.env.FAKE_WSL_DISTROS || 'Ubuntu').split(',').map((s) => s.trim()).filter(Boolean);
+
+function readState() {
+  try { return JSON.parse(fs.readFileSync(STATE, 'utf8')); } catch { return { running: {} }; }
+}
+function writeState(s) { fs.writeFileSync(STATE, JSON.stringify(s)); }
+function utf16(text) { process.stdout.write(Buffer.from(text, 'utf16le')); }
+function record(entry) {
+  fs.appendFileSync(path.join(ROOT, 'calls.jsonl'), `${JSON.stringify({ at: Date.now(), ...entry })}\n`);
+}
+
+function linuxEnv() {
+  const env = {
+    PATH: [process.env.FAKE_WSL_BIN, path.dirname(process.execPath), '/usr/local/bin', '/usr/bin', '/bin'].filter(Boolean).join(':'),
+    HOME: process.env.FAKE_WSL_HOME || '/tmp',
+    LANG: 'C.UTF-8'
+  };
+  if (process.env.TMUX_TMPDIR) env.TMUX_TMPDIR = process.env.TMUX_TMPDIR;
+  return env;
+}
+
+function stripDollar(command) {
+  if (process.env.FAKE_WSL_KEEP_DOLLAR === '1') return command;
+  return command.replace(/\$(\{[^}]*\}|\([^)]*\)|[A-Za-z_][A-Za-z0-9_]*|[0-9?#@*!$-])/g, '');
+}
+
+function killDistroProcesses() {
+  // Terminating a distro kills everything in it; our gateways live in tmux.
+  spawnSync('tmux', ['kill-server'], { env: linuxEnv(), stdio: 'ignore' });
+}
+
+const args = process.argv.slice(2);
+record({ args });
+
+if (args[0] === '-l' || args[0] === '--list') {
+  const state = readState();
+  if (args.includes('-v') || args.includes('--verbose')) {
+    let out = '  NAME      STATE           VERSION\r\n';
+    distros.forEach((d, i) => {
+      out += `${i === 0 ? '*' : ' '} ${d.padEnd(9)} ${(state.running[d] ? 'Running' : 'Stopped').padEnd(15)} 2\r\n`;
+    });
+    utf16(out);
+  } else {
+    utf16(distros.map((d) => `${d}\r\n`).join(''));
+  }
+  process.exit(0);
+}
+
+if (args[0] === '--terminate' || args[0] === '-t') {
+  const state = readState();
+  if (!distros.includes(args[1])) { utf16('There is no distribution with the supplied name.\r\n'); process.exit(1); }
+  state.running[args[1]] = false;
+  writeState(state);
+  killDistroProcesses();
+  utf16('The operation completed successfully.\r\n');
+  process.exit(0);
+}
+
+if (args[0] === '--shutdown') {
+  writeState({ running: {} });
+  killDistroProcesses();
+  process.exit(0);
+}
+
+if (args[0] === '-d' || args[0] === '--distribution') {
+  const distro = args[1];
+  if (!distros.includes(distro)) {
+    utf16('There is no distribution with the supplied name.\r\nError code: Wsl/Service/WSL_E_DISTRO_NOT_FOUND\r\n');
+    process.exit(1);
+  }
+  const sep = args.indexOf('--');
+  const cmd = sep >= 0 ? args.slice(sep + 1) : args.slice(2);
+  const state = readState();
+  state.running[distro] = true;
+  writeState(state);
+  let argv = cmd;
+  if (cmd[0] === 'bash' && (cmd[1] === '-lc' || cmd[1] === '-c')) {
+    argv = ['bash', '-c', stripDollar(cmd.slice(2).join(' '))];
+  }
+  // Own process group so killing wsl.exe ends the whole command (e.g. a
+  // `tail -F` log stream), like closing a real WSL session. tmux-launched
+  // gateways daemonize into their own session and survive, as on WSL.
+  const child = spawn(argv[0], argv.slice(1), { env: linuxEnv(), cwd: linuxEnv().HOME, stdio: 'inherit', detached: true });
+  child.on('exit', (code, signal) => process.exit(code === null ? (signal ? 1 : 0) : code));
+  child.on('error', (e) => { process.stderr.write(`${e.message}\n`); process.exit(1); });
+  const forward = (sig) => { try { process.kill(-child.pid, sig); } catch { /* gone */ } process.exit(1); };
+  process.on('SIGTERM', () => forward('SIGTERM'));
+  process.on('SIGINT', () => forward('SIGINT'));
+} else {
+  utf16(`Unsupported fake wsl.exe arguments: ${args.join(' ')}\r\n`);
+  process.exit(1);
+}
