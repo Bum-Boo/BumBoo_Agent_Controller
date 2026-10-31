@@ -1,5 +1,6 @@
 const fs = require('node:fs');
 const path = require('node:path');
+const { writeJsonAtomic, readJsonWithFallback } = require('./settings-store.cjs');
 
 const DEFAULTS = {
   distro: process.env.HERMES_CONTROLLER_DISTRO || 'Ubuntu',
@@ -49,21 +50,15 @@ function publicConfig(cfg) {
 }
 
 function loadControllerConfig(userData) {
-  const file = configPath(userData);
-  let local = {};
-  try {
-    local = JSON.parse(fs.readFileSync(file, 'utf8')) || {};
-  } catch {
-    local = {};
-  }
-  return normalizeConfig(local);
+  // A corrupt file falls back to the last good copy (.bak), then defaults.
+  const { value } = readJsonWithFallback(configPath(userData), {});
+  return normalizeConfig(value && typeof value === 'object' ? value : {});
 }
 
-function saveControllerConfig(userData, patch) {
+function saveControllerConfig(userData, patch, fsImpl = fs) {
   const file = configPath(userData);
   const current = loadControllerConfig(userData);
   const next = normalizeConfig({ ...current, ...(patch || {}) });
-  fs.mkdirSync(userData, { recursive: true });
   const toSave = {
     distro: next.distro,
     dashboardUrl: next.dashboardUrl,
@@ -73,7 +68,7 @@ function saveControllerConfig(userData, patch) {
     hermesCommand: next.hermesCommand,
     pollMs: next.pollMs
   };
-  fs.writeFileSync(file, JSON.stringify(toSave, null, 2));
+  writeJsonAtomic(file, toSave, fsImpl);
   return next;
 }
 
