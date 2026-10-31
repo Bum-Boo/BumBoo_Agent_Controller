@@ -71,9 +71,12 @@ function readConfig(name) {
   try { return parseYaml(fs.readFileSync(path.join(profileDir(name), 'config.yaml'), 'utf8')); } catch { return {}; }
 }
 
+// Zombies count as dead: in containers PID 1 often never reaps orphans, while
+// on a real WSL distro init does.
 function alive(pid) {
   if (!pid) return false;
-  try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
+  try { process.kill(pid, 0); } catch (e) { if (e.code !== 'EPERM') return false; }
+  try { return !/^\d+ \(.*\) Z/.test(fs.readFileSync(`/proc/${pid}/stat`, 'utf8')); } catch { return true; }
 }
 function pidOf(name) {
   const raw = (() => { try { return fs.readFileSync(path.join(profileDir(name), 'gateway.pid'), 'utf8'); } catch { return ''; } })();

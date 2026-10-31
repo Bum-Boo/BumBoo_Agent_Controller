@@ -106,7 +106,9 @@ async function createFakeEnv(options = {}) {
     },
     isAlive(pid) {
       if (!pid) return false;
-      try { process.kill(pid, 0); return true; } catch { return false; }
+      try { process.kill(pid, 0); } catch { return false; }
+      // Zombies (unreaped orphans in a container) are dead processes.
+      try { return !/^\d+ \(.*\) Z/.test(fs.readFileSync(`/proc/${pid}/stat`, 'utf8')); } catch { return true; }
     },
     readConfigYaml(name) { return fs.readFileSync(path.join(profileDir(name), 'config.yaml'), 'utf8'); },
     wslCalls() {
@@ -130,7 +132,7 @@ async function createFakeEnv(options = {}) {
         const pid = Number(fs.readFileSync(path.join(wslRoot, 'dashboard.pid'), 'utf8'));
         if (pid) process.kill(pid, 'SIGTERM');
       } catch { /* none */ }
-      fs.rmSync(root, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
   };
 }
