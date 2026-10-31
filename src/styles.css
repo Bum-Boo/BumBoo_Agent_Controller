@@ -1369,3 +1369,49 @@ footer strong {
 .controller-test-result.err strong { color: #fca5a5; }
 .controller-test-result small { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 @media (max-width: 980px) { .controller-config-grid .setting-row { grid-template-columns: 1fr; } }
+
+/* ---- Gateway lifecycle phase (requested / starting / running / failed) ---- */
+.phase-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 18px;
+  padding: 0 7px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 800;
+  flex: 0 0 auto;
+}
+.phase-chip.pending { background: rgba(96, 165, 250, 0.16); color: #bfdbfe; }
+.phase-chip.on { background: rgba(34, 197, 94, 0.14); color: #86efac; }
+.phase-chip.err { background: rgba(239, 68, 68, 0.16); color: #fca5a5; }
+.run-dot.pending { background: var(--blue); box-shadow: 0 0 0 3px rgba(96, 165, 250, 0.2); animation: dot-pulse 1s ease-in-out infinite; }
+.run-dot.failed { background: var(--red); box-shadow: 0 0 0 3px rgba(239, 68, 68, 0.2); animation: none; }
+.gw-toggle.pending { background: rgba(96, 165, 250, 0.22); color: #dbeafe; }
+.cell-error {
+  color: #fca5a5;
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+
+/* ---- Controller settings backup / restore ---- */
+.settings-backup-list { display: grid; gap: 6px; margin-top: 10px; }
+.settings-backup-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 7px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: rgba(9, 9, 11, 0.24);
+  font-size: 12px;
+}
+.settings-backup-row small { color: var(--muted); }
+.settings-backup-row.invalid { opacity: 0.55; }
+.settings-backup-result { margin-top: 10px; font-size: 12px; }
+.settings-backup-result.ok { color: #86efac; }
+.settings-backup-result.err { color: #fca5a5; }

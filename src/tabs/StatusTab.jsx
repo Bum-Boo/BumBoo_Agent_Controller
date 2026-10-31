@@ -212,15 +212,17 @@ export default function StatusTab({ status, mode, history, summary, t, busy, mes
       </section>
 
       <section className="actions">
+        {/* Partial (WSL up, Hermes not ready) offers both: Start is idempotent. */}
+        {!status.ready ? (
+          <button className="primary" disabled={busy} onClick={() => onAction('start')}>
+            <Power size={18} /> {t.start}
+          </button>
+        ) : null}
         {status.wslRunning ? (
           <button className="danger" disabled={busy} onClick={() => onAction('stop')}>
             <Power size={18} /> {t.stop}
           </button>
-        ) : (
-          <button className="primary" disabled={busy} onClick={() => onAction('start')}>
-            <Power size={18} /> {t.start}
-          </button>
-        )}
+        ) : null}
         <button className="danger-hard" disabled={busy || !status.wslRunning} onClick={onShutdownWsl} title="WSL2 백엔드 VM 전체를 종료하고 메모리를 해제합니다">
           <PowerOff size={18} /> WSL 종료
         </button>

@@ -4,6 +4,7 @@ import {
   RefreshCw, RotateCcw, Send, Settings, ShieldCheck, Square, Star, X
 } from 'lucide-react';
 import { Panel, ToggleSwitch } from '../components.jsx';
+import { gatewayView } from '../gateway-phase.mjs';
 
 const PLATFORM_ICON = { telegram: Send, discord: MessageCircle };
 const FILTERS = [
@@ -245,22 +246,38 @@ function ProfileSettingsModal({
   );
 }
 
-function ProfileRow({ p, label, crashed, runtimeState, busy, onToggle, onRestart, onOpenSettings }) {
+function GatewayPhaseChip({ view }) {
+  if (view.phase === 'stopped') return null;
+  const title = view.phase === 'failed' ? [view.error, view.detail].filter(Boolean).join('\n') : view.label;
+  return (
+    <span className={`phase-chip ${view.tone}`} title={title}>
+      {view.busy ? <RefreshCw size={11} className="spin" /> : null}
+      {view.label}
+    </span>
+  );
+}
+
+function ProfileRow({ p, label, crashed, runtimeState, phase, busy, onToggle, onRestart, onOpenSettings }) {
   const displayName = label?.label || p.name;
   const displayDesc = label?.desc || null;
-  const rowClass = ['prow', p.running ? 'is-running' : '', p.current ? 'is-current' : '', crashed ? 'is-crashed' : '', runtimeState?.restartNeeded ? 'needs-restart' : ''].filter(Boolean).join(' ');
+  const view = gatewayView(p, phase);
+  const locked = busy || view.busy;
+  const rowClass = ['prow', p.running ? 'is-running' : '', p.current ? 'is-current' : '', crashed ? 'is-crashed' : '', runtimeState?.restartNeeded ? 'needs-restart' : '', `phase-${view.phase}`].filter(Boolean).join(' ');
 
   return (
-    <div className={rowClass}>
-      <span className={`run-dot ${p.running ? 'on' : ''} ${crashed ? 'crash' : ''}`} />
+    <div className={rowClass} data-profile={p.name} data-phase={view.phase}>
+      <span className={`run-dot ${p.running ? 'on' : ''} ${crashed ? 'crash' : ''} ${view.tone === 'pending' ? 'pending' : ''} ${view.phase === 'failed' ? 'failed' : ''}`} />
       <span className="cell-name-stack">
         <span className="cell-name">
           {displayName}
           {p.current ? <Star size={13} className="star" /> : null}
           {crashed ? <span className="crash-tag" title="실행 중이던 게이트웨이가 중단됨"><AlertTriangle size={11} /> 중단됨</span> : null}
           {runtimeState?.restartNeeded ? <span className="restart-tag">재시작 필요</span> : null}
+          <GatewayPhaseChip view={view} />
         </span>
-        {displayDesc ? <span className="cell-desc">{displayDesc}</span> : displayName !== p.name ? <span className="cell-tech-name">{p.name}</span> : null}
+        {view.phase === 'failed' ? (
+          <span className="cell-error" title={view.detail || view.error}>{view.error}{view.detail ? ` — ${view.detail.split('\n').slice(-1)[0]}` : ''}</span>
+        ) : displayDesc ? <span className="cell-desc">{displayDesc}</span> : displayName !== p.name ? <span className="cell-tech-name">{p.name}</span> : null}
       </span>
       <span className="cell-muted profile-summary-cell">
         <span>{p.model || '—'}</span>
@@ -270,8 +287,14 @@ function ProfileRow({ p, label, crashed, runtimeState, busy, onToggle, onRestart
         {p.platforms && p.platforms.length > 0 ? p.platforms.map((pf) => <PlatformBadge key={pf.name} platform={pf} />) : <span className="pf-none">—</span>}
       </span>
       <span className="cell-action">
-        {runtimeState?.restartNeeded && p.running ? <button className="gw-toggle restart" disabled={busy} onClick={() => onRestart(p)}>재시작</button> : null}
-        {p.running ? <button className="gw-toggle stop" disabled={busy} onClick={() => onToggle(p)} title={`${displayName} 정지`}><Square size={14} /> 정지</button> : <button className="gw-toggle start" disabled={busy} onClick={() => onToggle(p)} title={`${displayName} 시작`}><Play size={14} /> 시작</button>}
+        {runtimeState?.restartNeeded && p.running ? <button className="gw-toggle restart" disabled={locked} onClick={() => onRestart(p)}>재시작</button> : null}
+        {view.busy ? (
+          <button className="gw-toggle pending" disabled title={view.label}><RefreshCw size={14} className="spin" /> {view.label}</button>
+        ) : p.running ? (
+          <button className="gw-toggle stop" disabled={locked} onClick={() => onToggle(p)} title={`${displayName} 정지`}><Square size={14} /> 정지</button>
+        ) : (
+          <button className="gw-toggle start" disabled={locked} onClick={() => onToggle(p)} title={`${displayName} 시작`}><Play size={14} /> {view.phase === 'failed' ? '다시 시도' : '시작'}</button>
+        )}
         <button className="gw-toggle settings" disabled={busy} onClick={() => onOpenSettings(p)} title={`${displayName} 설정`}><Settings size={14} /> 설정</button>
       </span>
     </div>
@@ -279,7 +302,7 @@ function ProfileRow({ p, label, crashed, runtimeState, busy, onToggle, onRestart
 }
 
 export default function ProfilesTab({
-  t, profiles, labels, opsState = { runtime: {}, history: [], watchdog: null }, modelOptions = [], reasoningOptions = [], crashed, busyName, loading,
+  t, profiles, labels, opsState = { runtime: {}, history: [], watchdog: null }, phases = {}, modelOptions = [], reasoningOptions = [], crashed, busyName, loading,
   onReload, onToggle, onRestart, onSetDefault, onUpdateModelSettings, onRestoreBackup, onLoadBackups, onLoadLogSummary, onSaveLabel
 }) {
   const [onlyRunning, setOnlyRunning] = useState(false);
@@ -287,7 +310,8 @@ export default function ProfilesTab({
   const [settingsProfileName, setSettingsProfileName] = useState('');
   const runtime = opsState.runtime || {};
 
-  const rank = (p) => (crashed.has(p.name) ? 0 : runtime[p.name]?.restartNeeded ? 1 : p.running ? 2 : 3);
+  const failed = (p) => gatewayView(p, phases[p.name]).phase === 'failed';
+  const rank = (p) => (crashed.has(p.name) || failed(p) ? 0 : runtime[p.name]?.restartNeeded ? 1 : p.running ? 2 : 3);
   const sorted = [...profiles].sort((a, b) => {
     const ra = rank(a);
     const rb = rank(b);
@@ -302,7 +326,7 @@ export default function ProfilesTab({
     if (filter === 'restart') return Boolean(runtime[p.name]?.restartNeeded);
     if (filter === 'codex') return p.provider === 'openai-codex' || /gpt-|codex/i.test(p.model || '');
     if (filter === 'claude') return p.provider === 'anthropic' || /claude/i.test(p.model || '');
-    if (filter === 'problems') return crashed.has(p.name) || Boolean(runtime[p.name]?.restartNeeded) || (p.platforms || []).some((pf) => pf.state === 'error');
+    if (filter === 'problems') return crashed.has(p.name) || failed(p) || Boolean(runtime[p.name]?.restartNeeded) || (p.platforms || []).some((pf) => pf.state === 'error');
     return true;
   });
   const runningCount = profiles.filter((p) => p.running).length;
@@ -324,7 +348,7 @@ export default function ProfilesTab({
       <Panel icon={Bot} title={t.tabProfiles} subtitle={`${t.profilesSubtitle}  ·  ${runningCount}/${profiles.length} ${t.running}  ·  재시작 필요 ${restartCount}`} action={action}>
         {filtered.length === 0 && !loading ? <div className="empty">{t.profilesEmpty}</div> : (
           <div className="table profiles-table">
-            {filtered.map((p) => <ProfileRow key={p.name} p={p} label={labels[p.name]} crashed={crashed.has(p.name)} runtimeState={runtime[p.name]} busy={busyName === p.name} onToggle={onToggle} onRestart={onRestart} onOpenSettings={(profile) => setSettingsProfileName(profile.name)} />)}
+            {filtered.map((p) => <ProfileRow key={p.name} p={p} label={labels[p.name]} crashed={crashed.has(p.name)} runtimeState={runtime[p.name]} phase={phases[p.name]} busy={busyName === p.name} onToggle={onToggle} onRestart={onRestart} onOpenSettings={(profile) => setSettingsProfileName(profile.name)} />)}
           </div>
         )}
       </Panel>

@@ -3,6 +3,7 @@ import { Bot, Cpu, LayoutGrid, Settings } from 'lucide-react';
 import { createRoot } from 'react-dom/client';
 import { Tabs, ToastStack } from './components.jsx';
 import { makeStrings, messageKeyForStatus, formatTime } from './i18n.js';
+import { applyPhaseEvent, gatewayToast, serviceMessageKey } from './gateway-phase.mjs';
 import StatusTab from './tabs/StatusTab.jsx';
 import ProfilesTab from './tabs/ProfilesTab.jsx';
 import DiagnosticsTab from './tabs/DiagnosticsTab.jsx';
@@ -47,6 +48,9 @@ function App() {
   const [modelOptions, setModelOptions] = useState({ models: [], reasoning: [] });
   const [opsState, setOpsState] = useState({ runtime: {}, history: [], watchdog: null });
   const [crashed, setCrashed] = useState(() => new Set());
+  // Gateway lifecycle phases pushed by the main process (requested/starting/
+  // running/stopping/failed...), keyed by profile name.
+  const [phases, setPhases] = useState({});
 
   // Toasts
   const [toasts, setToasts] = useState([]);
@@ -99,6 +103,7 @@ function App() {
       if (active && next) setModelOptions({ models: next.models || [], reasoning: next.reasoning || [] });
     });
     window.hermes.getMode().then((m) => { if (active && m) setMode(m); });
+    window.hermes.getGatewayPhases().then((snap) => { if (active && snap) setPhases((prev) => ({ ...snap, ...prev })); });
     refresh();
     refreshHistory();
     loadProfiles();
@@ -117,6 +122,9 @@ function App() {
     // Watchdog pushes the full profile list on its own cadence (~20s).
     const unsubscribeProfiles = window.hermes.onProfilesUpdated((payload) => {
       if (payload && Array.isArray(payload.profiles)) setProfiles(payload.profiles);
+    });
+    const unsubscribePhase = window.hermes.onGatewayPhase((entry) => {
+      setPhases((prev) => applyPhaseEvent(prev, entry));
     });
     // Gateway lifecycle events → toasts + crash badges.
     const unsubscribeGw = window.hermes.onGatewayEvent((e) => {
@@ -143,6 +151,7 @@ function App() {
       unsubscribeSettings();
       unsubscribeProfiles();
       unsubscribeGw();
+      unsubscribePhase();
       clearInterval(timer);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -154,7 +163,8 @@ function App() {
     try {
       const next = action === 'start' ? await window.hermes.start() : await window.hermes.stop();
       setStatus(next);
-      setMessageKey(next.ready ? 'readyMessage' : action === 'stop' ? 'stoppedClean' : 'startSent');
+      setMessageKey(serviceMessageKey(action, next));
+      if (next && next.error) pushToast(next.error, 'warn', 9000);
     } finally {
       setBusy(false);
     }
@@ -206,25 +216,31 @@ function App() {
   };
 
   // --- profile actions (lifted so Status + Profiles + watchdog stay in sync) ---
-  const toggleGateway = async (p) => {
+  // Start/stop/restart resolve only when the main process has confirmed the
+  // gateway's real state; the row shows the intermediate phases meanwhile.
+  const runGateway = async (action, p) => {
     setBusyName(p.name);
     const label = nameOf(p.name);
     try {
-      if (p.running) {
-        await window.hermes.gatewayStop(p.name);
-        pushToast(`${label} 게이트웨이 정지`, 'info');
-      } else {
-        // Clear any prior crash flag — the user is deliberately (re)starting it.
-        setCrashed((prev) => { const n = new Set(prev); n.delete(p.name); return n; });
-        await window.hermes.gatewayStart(p.name);
-        pushToast(`${label} 게이트웨이 시작`, 'ok');
+      // Clear any prior crash flag — the user is deliberately (re)starting it.
+      if (action !== 'stop') setCrashed((prev) => { const n = new Set(prev); n.delete(p.name); return n; });
+      const call = { start: window.hermes.gatewayStart, stop: window.hermes.gatewayStop, restart: window.hermes.gatewayRestart }[action];
+      let result;
+      try {
+        result = await call(p.name);
+      } catch (error) {
+        result = { ok: false, phase: 'failed', error: String(error && error.message ? error.message : error) };
       }
+      const toast = gatewayToast(action, result, label);
+      pushToast(toast.msg, toast.tone, toast.tone === 'err' ? 9000 : 4500);
       await loadProfiles(false);
-      setTimeout(() => loadProfiles(false), 2500);
+      return { ok: Boolean(result && result.ok), result };
     } finally {
       setBusyName('');
     }
   };
+
+  const toggleGateway = (p) => runGateway(p.running ? 'stop' : 'start', p);
 
   const setDefaultProfile = async (name) => {
     setBusyName(name);
@@ -235,24 +251,7 @@ function App() {
     } finally { setBusyName(''); }
   };
 
-  const restartGateway = async (p) => {
-    setBusyName(p.name);
-    const label = nameOf(p.name);
-    try {
-      await window.hermes.gatewayStop(p.name);
-      setCrashed((prev) => { const n = new Set(prev); n.delete(p.name); return n; });
-      await window.hermes.gatewayStart(p.name);
-      pushToast(`${label} 게이트웨이 재시작`, 'ok');
-      await loadProfiles(false);
-      setTimeout(() => loadProfiles(false), 2500);
-      return { ok: true };
-    } catch (error) {
-      pushToast(`${label} 게이트웨이 재시작 실패`, 'err', 7000);
-      return { ok: false, error };
-    } finally {
-      setBusyName('');
-    }
-  };
+  const restartGateway = (p) => runGateway('restart', p);
 
   const saveLabel = async (name, label, desc) => {
     const updated = await window.hermes.setProfileLabel(name, label, desc);
@@ -342,6 +341,7 @@ function App() {
           modelOptions={modelOptions.models}
           reasoningOptions={modelOptions.reasoning}
           opsState={opsState}
+          phases={phases}
           crashed={crashed}
           busyName={busyName}
           loading={profilesLoading}
@@ -357,7 +357,7 @@ function App() {
         />
       )}
       {tab === 'diagnostics' && <DiagnosticsTab t={t} />}
-      {tab === 'settings' && <SettingsTab settings={settings} settingsBusy={settingsBusy} t={t} onUpdate={updateSettings} onToast={pushToast} />}
+      {tab === 'settings' && <SettingsTab settings={settings} settingsBusy={settingsBusy} t={t} onUpdate={updateSettings} onToast={pushToast} onSettingsRestored={() => loadProfiles(false)} />}
 
       <footer>
         <span>{t.localOnly}</span>

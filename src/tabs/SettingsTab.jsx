@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Gauge, Languages, LifeBuoy, MemoryStick, MonitorOff, Moon, Power, RotateCcw, Save, Settings, Timer, Zap } from 'lucide-react';
+import { Archive, Gauge, Languages, LifeBuoy, MemoryStick, MonitorOff, Moon, Power, RotateCcw, Save, Settings, Timer, Zap } from 'lucide-react';
 import { Panel, SettingRow, ToggleSwitch } from '../components.jsx';
 import { languageOptions } from '../i18n.js';
 import LogTab from './LogTab.jsx';
@@ -110,7 +110,7 @@ function RuntimeConfigPanel({ onToast }) {
       const res = await window.hermes.updateControllerConfig(draft);
       setConfig(res.config);
       setDraft(res.config || draft);
-      if (onToast) onToast('Hermes 연결 설정 저장 완료', 'ok');
+      if (onToast) onToast(res.ok === false ? res.error : 'Hermes 연결 설정 저장 완료', res.ok === false ? 'err' : 'ok', res.ok === false ? 9000 : 4500);
     } finally { setBusy(false); }
   };
 
@@ -156,6 +156,67 @@ function RuntimeConfigPanel({ onToast }) {
         <button className="ghost small" disabled={busy} onClick={test}>연결 테스트</button>
         <button className="gw-toggle start" disabled={busy} onClick={save}><Save size={15} /> 저장</button>
       </div>
+    </Panel>
+  );
+}
+
+// Backup / restore of the controller's own settings (app settings, Hermes
+// connection settings, profile display names). A restore that fails part-way
+// is rolled back to the settings in place before it started.
+function SettingsBackupPanel({ onToast, onRestored }) {
+  const [backups, setBackups] = useState([]);
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState(null);
+
+  const reload = async () => {
+    const list = await window.hermes.listSettingsBackups();
+    setBackups(Array.isArray(list) ? list : []);
+  };
+
+  useEffect(() => { reload(); }, []);
+
+  const create = async () => {
+    setBusy(true);
+    try {
+      const res = await window.hermes.createSettingsBackup();
+      setResult(res && res.ok ? { ok: true, msg: `백업 생성: ${res.id}` } : { ok: false, msg: `백업 실패: ${(res && res.error) || '알 수 없는 오류'}` });
+      await reload();
+    } finally { setBusy(false); }
+  };
+
+  const restore = async (id) => {
+    if (!window.confirm(`설정을 ${id} 백업으로 되돌릴까요?\n지금 설정은 pre-restore 백업으로 먼저 저장됩니다.`)) return;
+    setBusy(true);
+    try {
+      const res = await window.hermes.restoreSettingsBackup(id);
+      if (res && res.ok) {
+        setResult({ ok: true, msg: `${id} 복원 완료 (되돌리기: ${res.preRestoreId || '없음'})` });
+        if (onToast) onToast('설정 복원 완료', 'ok');
+        if (onRestored) onRestored(res);
+      } else {
+        const msg = `복원 실패: ${(res && res.error) || '알 수 없는 오류'}${res && res.rolledBack ? ' · 이전 설정으로 복구됨' : ''}`;
+        setResult({ ok: false, msg });
+        if (onToast) onToast(msg, 'err', 9000);
+      }
+      await reload();
+    } finally { setBusy(false); }
+  };
+
+  return (
+    <Panel icon={Archive} title="설정 백업 / 복원" subtitle="앱 설정 · Hermes 연결 설정 · 프로필 표시 이름을 사용자 앱 데이터에 백업합니다.">
+      <div className="wsl-mem-actions">
+        <div className="wsl-mem-note">복원 중 오류가 나면 복원 직전 설정으로 자동 복구됩니다.</div>
+        <button className="gw-toggle start" disabled={busy} onClick={create}><Archive size={15} /> 지금 백업</button>
+      </div>
+      <div className="settings-backup-list">
+        {backups.length ? backups.slice(0, 10).map((b) => (
+          <div className={`settings-backup-row ${b.valid ? '' : 'invalid'}`} key={b.id} data-backup-id={b.id}>
+            <span>{b.id} <small>{b.valid ? b.reason : '손상됨'}</small></span>
+            <button className="ghost small" disabled={busy || !b.valid} onClick={() => restore(b.id)}><RotateCcw size={12} /> 복원</button>
+          </div>
+        )) : <span className="pf-none">아직 백업 없음</span>}
+      </div>
+      {result ? <div className={`settings-backup-result ${result.ok ? 'ok' : 'err'}`}>{result.msg}</div> : null}
     </Panel>
   );
 }
@@ -241,10 +302,14 @@ function WslMemoryPanel({ onToast }) {
   );
 }
 
-export default function SettingsTab({ settings, settingsBusy, t, onUpdate, onToast }) {
+export default function SettingsTab({ settings, settingsBusy, t, onUpdate, onToast, onSettingsRestored }) {
+  // Remount the connection panel after a restore so it re-reads the config.
+  const [restoreCount, setRestoreCount] = useState(0);
   return (
     <div className="settings-stack">
-      <RuntimeConfigPanel onToast={onToast} />
+      <RuntimeConfigPanel key={restoreCount} onToast={onToast} />
+
+      <SettingsBackupPanel onToast={onToast} onRestored={() => { setRestoreCount((n) => n + 1); if (onSettingsRestored) onSettingsRestored(); }} />
 
       <Panel icon={Power} title={t.powerSettings} subtitle={t.powerSettingsSubtitle}>
         <div className="settings-grid">
