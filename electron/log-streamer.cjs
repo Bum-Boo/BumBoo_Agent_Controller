@@ -11,6 +11,7 @@
 
 const { spawn } = require('node:child_process');
 const readline = require('node:readline');
+const { shellQuote } = require('./shell.cjs');
 
 function b64wrap(script) {
   const b64 = Buffer.from(script, 'utf8').toString('base64');
@@ -34,6 +35,7 @@ function createLogStreamer(deps) {
   }
 
   function start(name = '__all__') {
+    if (name !== '__all__' && !/^[A-Za-z0-9_-]+$/.test(String(name))) return { ok: false, error: 'invalid profile name' };
     stop();
     current = name;
     const streamName = name;
@@ -42,7 +44,7 @@ function createLogStreamer(deps) {
       script = `python3 - <<'PY'
 import subprocess, sys
 from pathlib import Path
-home = Path('${hermesHome}') / 'profiles'
+home = Path(${JSON.stringify(hermesHome || '')}) / 'profiles'
 files = []
 if home.exists():
     for profile in sorted(p for p in home.iterdir() if p.is_dir()):
@@ -70,8 +72,8 @@ PY`;
     } else {
       const base = `${hermesHome}/profiles/${name}/logs`;
       script =
-        `f="${base}/gateway.log"; ` +
-        `if [ ! -s "$f" ]; then f="${base}/gateway.controller.log"; fi; ` +
+        `f=${shellQuote(`${base}/gateway.log`)}; ` +
+        `if [ ! -s "$f" ]; then f=${shellQuote(`${base}/gateway.controller.log`)}; fi; ` +
         `tail -n 250 -F "$f" 2>/dev/null`;
     }
 

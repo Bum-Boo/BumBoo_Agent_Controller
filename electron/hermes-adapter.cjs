@@ -14,9 +14,23 @@
 // Injected `runWsl(command, timeoutMs)` resolves to
 //   { ok, code, stdout, stderr, error }.
 
+const { shellQuote } = require('./shell.cjs');
+
+const PROFILE_NAME = /^[A-Za-z0-9_-]+$/;
+
+function validName(name) {
+  return typeof name === 'string' && PROFILE_NAME.test(name);
+}
+
 function createHermesAdapter(runWsl, config) {
   const home = config.hermesHome;
-  const envPrefix = `cd ${config.labRoot} && HERMES_HOME=${home} `;
+  // Every user-supplied path/command is quoted: settings may contain spaces or
+  // quotes, and an empty labRoot must not turn into a bare `cd` (= $HOME).
+  const qHome = shellQuote(home);
+  const hermesBin = shellQuote(config.hermesCommand || 'hermes');
+  const envPrefix = `${config.labRoot ? `cd ${shellQuote(config.labRoot)} && ` : ''}HERMES_HOME=${qHome} `;
+  // Python string literal for HERMES_HOME (JSON strings are valid Python).
+  const pyHome = JSON.stringify(home || '');
 
   const MODEL_OPTIONS = [
     { id: 'gpt-5.5', label: 'GPT-5.5', provider: 'openai-codex', baseUrl: 'https://chatgpt.com/backend-api/codex' },
@@ -35,11 +49,7 @@ function createHermesAdapter(runWsl, config) {
   ];
 
   function hermes(args, timeoutMs = 12000) {
-    return runWsl(`${envPrefix}hermes ${args}`, timeoutMs);
-  }
-
-  function shellQuote(value) {
-    return `'${String(value).replace(/'/g, "'\\''")}'`;
+    return runWsl(`${envPrefix}${hermesBin} ${args}`, timeoutMs);
   }
 
   // wsl.exe (via execFile) strips `$var`/`$(...)` from the inline command
@@ -67,7 +77,7 @@ function createHermesAdapter(runWsl, config) {
   // Dump every profile's gateway_state.json in one shot, framed by @@@<name>.
   function dumpStatesCommand() {
     return (
-      `for f in ${home}/profiles/*/gateway_state.json; do ` +
+      `for f in ${qHome}/profiles/*/gateway_state.json; do ` +
       `[ -e "$f" ] || continue; ` +
       `n=$(basename "$(dirname "$f")"); ` +
       `echo "@@@$n"; cat "$f"; echo; ` +
@@ -105,7 +115,7 @@ function createHermesAdapter(runWsl, config) {
   }
 
   function dumpProfileConfigsCommand() {
-    return `HERMES_HOME=${home} python3 - <<'PY'
+    return `HERMES_HOME=${qHome} python3 - <<'PY'
 import json
 from pathlib import Path
 try:
@@ -113,7 +123,7 @@ try:
 except Exception:
     yaml = None
 
-base = Path('${home}') / 'profiles'
+base = Path(${pyHome}) / 'profiles'
 out = {}
 if base.exists() and yaml is not None:
     for profile_dir in sorted(p for p in base.iterdir() if p.is_dir()):
@@ -201,7 +211,7 @@ PY`;
   }
 
   async function setProfileModelSettings(name, patch = {}) {
-    if (!name || !/^[A-Za-z0-9_-]+$/.test(name)) {
+    if (!validName(name)) {
       return { ok: false, error: 'invalid profile name' };
     }
 
@@ -209,26 +219,26 @@ PY`;
     if (Object.prototype.hasOwnProperty.call(patch, 'model')) {
       const option = findModelOption(patch.model);
       if (!option) return { ok: false, error: 'unsupported model' };
-      commands.push(`hermes --profile ${shellQuote(name)} config set model.provider ${shellQuote(option.provider)}`);
-      commands.push(`hermes --profile ${shellQuote(name)} config set model.default ${shellQuote(option.id)}`);
-      commands.push(`hermes --profile ${shellQuote(name)} config set model.base_url ${shellQuote(option.baseUrl)}`);
+      commands.push(`${hermesBin} --profile ${shellQuote(name)} config set model.provider ${shellQuote(option.provider)}`);
+      commands.push(`${hermesBin} --profile ${shellQuote(name)} config set model.default ${shellQuote(option.id)}`);
+      commands.push(`${hermesBin} --profile ${shellQuote(name)} config set model.base_url ${shellQuote(option.baseUrl)}`);
     }
 
     if (Object.prototype.hasOwnProperty.call(patch, 'reasoning')) {
       const reasoning = patch.reasoning || '';
       if (!findReasoningOption(reasoning)) return { ok: false, error: 'unsupported reasoning effort' };
-      commands.push(`hermes --profile ${shellQuote(name)} config set agent.reasoning_effort ${shellQuote(reasoning)}`);
+      commands.push(`${hermesBin} --profile ${shellQuote(name)} config set agent.reasoning_effort ${shellQuote(reasoning)}`);
     }
 
     if (!commands.length) return { ok: true, output: 'no changes' };
 
     const script = [
       'set -euo pipefail',
-      `backup_dir="${home}/backups/controller-profile-models/$(date +%Y%m%d-%H%M%S)-${name}"`,
+      `backup_dir=${qHome}/backups/controller-profile-models/"$(date +%Y%m%d-%H%M%S)-${name}"`,
       'mkdir -p "$backup_dir"',
       `cp -a ${shellQuote(`${home}/profiles/${name}/config.yaml`)} "$backup_dir/config.yaml"`,
       ...commands,
-      `hermes --profile ${shellQuote(name)} config check >/dev/null`,
+      `${hermesBin} --profile ${shellQuote(name)} config check >/dev/null`,
       'echo "$backup_dir"'
     ].join('\n');
     const result = await runWsl(b64wrap(script), 30000);
@@ -241,12 +251,12 @@ PY`;
 
 
   async function listProfileBackups(name) {
-    if (!name || !/^[A-Za-z0-9_-]+$/.test(name)) return { ok: false, backups: [], error: 'invalid profile name' };
+    if (!validName(name)) return { ok: false, backups: [], error: 'invalid profile name' };
     const script = `python3 - <<'PY'
 import json, os, re
 from pathlib import Path
 name = ${JSON.stringify(name)}
-base = Path('${home}') / 'backups' / 'controller-profile-models'
+base = Path(${pyHome}) / 'backups' / 'controller-profile-models'
 items = []
 if base.exists():
     for d in base.iterdir():
@@ -266,18 +276,18 @@ PY`;
   }
 
   async function restoreProfileBackup(name, backupId) {
-    if (!name || !/^[A-Za-z0-9_-]+$/.test(name)) return { ok: false, error: 'invalid profile name' };
+    if (!validName(name)) return { ok: false, error: 'invalid profile name' };
     if (!backupId || !/^[A-Za-z0-9_-]+$/.test(backupId) || !backupId.endsWith(`-${name}`)) return { ok: false, error: 'invalid backup id' };
     const script = [
       'set -euo pipefail',
       `backup=${shellQuote(`${home}/backups/controller-profile-models/${backupId}/config.yaml`)}`,
       `target=${shellQuote(`${home}/profiles/${name}/config.yaml`)}`,
       'test -f "$backup"',
-      `rollback_dir="${home}/backups/controller-profile-restore/$(date +%Y%m%d-%H%M%S)-${name}"`,
+      `rollback_dir=${qHome}/backups/controller-profile-restore/"$(date +%Y%m%d-%H%M%S)-${name}"`,
       'mkdir -p "$rollback_dir"',
       'cp -a "$target" "$rollback_dir/config.yaml"',
       'cp -a "$backup" "$target"',
-      `hermes --profile ${shellQuote(name)} config check >/dev/null`,
+      `${hermesBin} --profile ${shellQuote(name)} config check >/dev/null`,
       'echo "$rollback_dir"'
     ].join('\n');
     const result = await runWsl(b64wrap(script), 30000);
@@ -285,12 +295,12 @@ PY`;
   }
 
   async function profileLogSummary(name) {
-    if (!name || !/^[A-Za-z0-9_-]+$/.test(name)) return { ok: false, error: 'invalid profile name' };
+    if (!validName(name)) return { ok: false, error: 'invalid profile name' };
     const script = `python3 - <<'PY'
 import json, re
 from pathlib import Path
 name = ${JSON.stringify(name)}
-base = Path('${home}') / 'profiles' / name / 'logs'
+base = Path(${pyHome}) / 'profiles' / name / 'logs'
 paths = [base / 'gateway.log', base / 'gateway.controller.log']
 lines = []
 source = ''
@@ -325,6 +335,7 @@ PY`;
 
   // Set the sticky default profile. Safe, idempotent.
   async function useProfile(name) {
+    if (!validName(name)) return { ok: false, error: 'invalid profile name' };
     const result = await hermes(`profile use ${shellQuote(name)}`, 12000);
     return { ok: result.ok, output: (result.stdout || result.stderr || '').trim() };
   }
@@ -338,12 +349,12 @@ PY`;
   // the gateway alive (this is how `sense` survives). The tmux window closes by
   // itself when the gateway stops, so no session leaks.
   async function gatewayStartProfile(name) {
+    if (!validName(name)) return { ok: false, error: 'invalid profile name' };
     const session = `gw-${name}`;
     const logDir = `${home}/profiles/${name}/logs`;
     const logFile = `${logDir}/gateway.controller.log`;
     const inner =
-      `cd ${config.labRoot} && HERMES_HOME=${home} ` +
-      `hermes --profile ${name} gateway run --replace >> ${logFile} 2>&1`;
+      `${envPrefix}${hermesBin} --profile ${name} gateway run --replace >> ${shellQuote(logFile)} 2>&1`;
     const cmd =
       `mkdir -p ${shellQuote(logDir)}; ` +
       `tmux kill-session -t ${shellQuote(session)} 2>/dev/null; ` +
@@ -355,14 +366,82 @@ PY`;
 
   // Stop a specific profile's gateway via its pidfile.
   async function gatewayStopProfile(name) {
+    if (!validName(name)) return { ok: false, error: 'invalid profile name' };
     const result = await hermes(`--profile ${shellQuote(name)} gateway stop`, 20000);
     return { ok: result.ok, output: (result.stdout || result.stderr || '').trim() };
   }
 
+  // Process-level probe for one gateway, used to tell "start request sent"
+  // apart from "actually running": is the controller's tmux session alive, is
+  // the pid from gateway.pid / gateway_state.json alive (zombies count as
+  // dead), plus the last lines the launch wrote, for failure messages.
+  async function gatewayProcessStatus(name) {
+    if (!validName(name)) return { ok: false, error: 'invalid profile name' };
+    const script = `python3 - <<'PY'
+import json, os, subprocess
+from pathlib import Path
+name = ${JSON.stringify(name)}
+base = Path(${pyHome}) / 'profiles' / name
+
+def read_pid():
+    for f in (base / 'gateway.pid', base / 'gateway_state.json'):
+        try:
+            raw = f.read_text(encoding='utf-8').strip()
+        except Exception:
+            continue
+        try:
+            return int(raw)
+        except ValueError:
+            pass
+        try:
+            pid = json.loads(raw).get('pid')
+            if pid:
+                return int(pid)
+        except Exception:
+            pass
+    return None
+
+def alive(pid):
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    try:
+        stat = Path('/proc/%d/stat' % pid).read_text()
+        return stat.rsplit(')', 1)[1].split()[0] != 'Z'
+    except Exception:
+        return True
+
+try:
+    session = subprocess.run(['tmux', 'has-session', '-t', 'gw-' + name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+except Exception:
+    session = False
+pid = read_pid()
+tail = []
+for f in (base / 'logs' / 'gateway.controller.log', base / 'logs' / 'gateway.log'):
+    try:
+        lines = [ln for ln in f.read_text(encoding='utf-8', errors='replace').splitlines() if ln.strip()]
+    except Exception:
+        continue
+    if lines:
+        tail = lines[-8:]
+        break
+print(json.dumps({'ok': True, 'sessionAlive': session, 'pid': pid, 'running': alive(pid), 'logTail': '\\n'.join(ln[-300:] for ln in tail)}, ensure_ascii=False))
+PY`;
+    const result = await runWsl(b64wrap(script), 10000);
+    try { return JSON.parse(result.stdout || '{}'); }
+    catch { return { ok: false, error: result.stderr || result.error || 'process probe failed' }; }
+  }
+
   return {
     listProfiles, modelOptions, setProfileModelSettings, listProfileBackups,
-    restoreProfileBackup, profileLogSummary, useProfile, gatewayStartProfile, gatewayStopProfile
+    restoreProfileBackup, profileLogSummary, useProfile, gatewayStartProfile, gatewayStopProfile,
+    gatewayProcessStatus
   };
 }
 
-module.exports = { createHermesAdapter };
+module.exports = { createHermesAdapter, validName };

@@ -1,11 +1,11 @@
 const { app, BrowserWindow, Tray, Menu, nativeImage, ipcMain, shell, dialog, Notification, powerMonitor, powerSaveBlocker } = require('electron');
-const { execFile } = require('node:child_process');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const http = require('node:http');
 
 const power = require('./power.cjs');
+const { wslPath, shellQuote, run, createWslRunner } = require('./shell.cjs');
 const { createHermesAdapter } = require('./hermes-adapter.cjs');
 const { createModeManager } = require('./mode-manager.cjs');
 const { createGatewayWatchdog } = require('./gateway-watchdog.cjs');
@@ -50,46 +50,17 @@ function sendToWindow(channel, payload) {
   }
 }
 
-function wslPath() {
-  return path.join(process.env.WINDIR || 'C:\\Windows', 'System32', 'wsl.exe');
-}
-
-
-function shellQuote(value) {
-  return `'${String(value).replace(/'/g, "'\''")}'`;
-}
-
 function hermesEnvPrefix() {
   const cd = CONFIG.labRoot ? `cd ${shellQuote(CONFIG.labRoot)} && ` : '';
   const home = CONFIG.hermesHome ? `HERMES_HOME=${shellQuote(CONFIG.hermesHome)} ` : '';
   return `${cd}${home}`;
 }
 
-function run(file, args, timeoutMs = 10000) {
-  return new Promise((resolve) => {
-    const child = execFile(file, args, { windowsHide: true, timeout: timeoutMs }, (error, stdout, stderr) => {
-      resolve({
-        ok: !error,
-        code: error && typeof error.code !== 'undefined' ? error.code : 0,
-        stdout: stdout || '',
-        stderr: stderr || '',
-        error: error ? error.message : ''
-      });
-    });
-    child.on('error', (error) => {
-      resolve({ ok: false, code: -1, stdout: '', stderr: '', error: error.message });
-    });
-  });
-}
-
 function runPowerShell(command, timeoutMs = 10000) {
   return run('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', command], timeoutMs);
 }
 
-function runWsl(command, timeoutMs = 10000) {
-  const distro = CONFIG && CONFIG.distro ? CONFIG.distro : 'Ubuntu';
-  return run(wslPath(), ['-d', distro, '--', 'bash', '-lc', command], timeoutMs);
-}
+const runWsl = createWslRunner(() => CONFIG);
 
 function psSingleQuote(value) {
   return String(value).replace(/'/g, "''");
