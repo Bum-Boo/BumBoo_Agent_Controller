@@ -55,6 +55,11 @@ async function createFakeEnv(options = {}) {
   const tmuxDir = path.join(root, 'tmux');
   for (const d of [wslRoot, hermesHome, labRoot, tmuxDir, path.join(hermesHome, 'profiles')]) fs.mkdirSync(d, { recursive: true });
 
+  // Per-environment copy of the Linux-side fakes, so a test can hide or
+  // replace one without affecting other test files running in parallel.
+  const wslBin = path.join(root, 'wsl-bin');
+  fs.cpSync(path.join(HARNESS, 'wsl-bin'), wslBin, { recursive: true });
+
   const profiles = options.profiles || { alpha: {}, beta: {} };
   for (const [name, spec] of Object.entries(profiles)) writeProfile(hermesHome, name, spec);
   fs.writeFileSync(path.join(hermesHome, 'fake-auth.json'), JSON.stringify({ loggedIn: options.loggedIn !== false }));
@@ -65,7 +70,7 @@ async function createFakeEnv(options = {}) {
     PATH: `${path.join(HARNESS, 'windows-bin')}${path.delimiter}${process.env.PATH}`,
     FAKE_WSL_ROOT: wslRoot,
     FAKE_WSL_HOME: home,
-    FAKE_WSL_BIN: path.join(HARNESS, 'wsl-bin'),
+    FAKE_WSL_BIN: wslBin,
     FAKE_WSL_DISTROS: (options.distros || ['Ubuntu']).join(','),
     FAKE_DASHBOARD_PORT: String(dashboardPort),
     TMUX_TMPDIR: tmuxDir
@@ -86,6 +91,7 @@ async function createFakeEnv(options = {}) {
   return {
     root,
     home,
+    wslBin,
     hermesHome,
     labRoot,
     env,

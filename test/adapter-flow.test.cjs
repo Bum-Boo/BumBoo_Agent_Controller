@@ -47,7 +47,8 @@ test('discovers profiles with model/reasoning from config.yaml', async () => {
 test('start -> running with live pid and connected platform; stop -> stopped', async () => {
   const started = await adapter.gatewayStartProfile('alpha');
   assert.equal(started.ok, true);
-  const running = await waitFor(async () => { const p = await profile('alpha'); return p.running && p; });
+  // gateway.pid and gateway_state.json are written one after the other.
+  const running = await waitFor(async () => { const p = await profile('alpha'); return p.running && p.pid && p; });
   assert.ok(fake.isAlive(running.pid), 'pid from gateway_state.json is a live process');
   assert.deepEqual(running.platforms, [{ name: 'telegram', state: 'connected' }]);
   assert.deepEqual(fake.tmuxSessions(), ['gw-alpha']);
@@ -62,9 +63,9 @@ test('start -> running with live pid and connected platform; stop -> stopped', a
 
 test('restart (start with --replace while running) replaces the process', async () => {
   await adapter.gatewayStartProfile('alpha');
-  const first = await waitFor(async () => { const p = await profile('alpha'); return p.running && p; });
+  const first = await waitFor(async () => { const p = await profile('alpha'); return p.running && p.pid && p; });
   await adapter.gatewayStartProfile('alpha');
-  const second = await waitFor(async () => { const p = await profile('alpha'); return p.running && p.pid !== first.pid && p; });
+  const second = await waitFor(async () => { const p = await profile('alpha'); return p.running && p.pid && p.pid !== first.pid && p; });
   assert.equal(fake.isAlive(first.pid), false, 'old gateway process is gone');
   assert.ok(fake.isAlive(second.pid));
   await adapter.gatewayStopProfile('alpha');
@@ -122,7 +123,7 @@ test('honours an absolute hermesCommand that is not on PATH (regression)', async
   fs.chmodSync(path.join(binDir, 'hermes-custom'), 0o755);
   // Hide the PATH copy: only the absolute path can work.
   const cfg = { ...config, hermesCommand: path.join(binDir, 'hermes-custom') };
-  const hidden = path.join(__dirname, 'harness', 'wsl-bin', 'hermes');
+  const hidden = path.join(fake.wslBin, 'hermes');
   const a = createHermesAdapter(createWslRunner(() => cfg), cfg);
   fs.renameSync(hidden, `${hidden}.hidden`);
   try {
@@ -142,7 +143,7 @@ test('paths with spaces and quotes work (regression)', async () => {
     const lab = path.join(odd.root, 'lab dir');
     fs.mkdirSync(lab);
     const cfg = { ...odd.config, hermesHome: home, labRoot: lab };
-    Object.assign(process.env, { TMUX_TMPDIR: odd.env.TMUX_TMPDIR, FAKE_WSL_ROOT: odd.env.FAKE_WSL_ROOT, FAKE_WSL_HOME: odd.env.FAKE_WSL_HOME });
+    odd.install();
     const a = createHermesAdapter(createWslRunner(() => cfg), cfg);
     const list = await a.listProfiles();
     assert.equal(list.ok, true, list.error);
