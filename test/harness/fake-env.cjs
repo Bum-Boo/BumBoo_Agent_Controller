@@ -134,10 +134,14 @@ async function createFakeEnv(options = {}) {
     },
     cleanup() {
       spawnSync('tmux', ['kill-server'], { env: { ...process.env, TMUX_TMPDIR: tmuxDir }, stdio: 'ignore' });
-      try {
-        const pid = Number(fs.readFileSync(path.join(wslRoot, 'dashboard.pid'), 'utf8'));
-        if (pid) process.kill(pid, 'SIGTERM');
-      } catch { /* none */ }
+      // The dashboard server carries wslRoot in its argv; find it even if the
+      // pidfile is gone.
+      for (const pid of fs.readdirSync('/proc').filter((d) => /^\d+$/.test(d))) {
+        try {
+          const cmd = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8');
+          if (cmd.includes('dashboard-server.cjs') && cmd.includes(wslRoot)) process.kill(Number(pid), 'SIGTERM');
+        } catch { /* gone or not ours */ }
+      }
       fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
   };

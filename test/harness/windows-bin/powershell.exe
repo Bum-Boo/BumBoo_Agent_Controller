@@ -25,7 +25,11 @@ if (/Start-ScheduledTask/.test(command)) {
     process.exit(1);
   }
   if (!alive(currentPid()) && process.env.FAKE_DASHBOARD_PORT) {
-    const child = spawn(process.execPath, [path.join(__dirname, '..', 'dashboard-server.cjs'), process.env.FAKE_DASHBOARD_PORT], { detached: true, stdio: 'ignore' });
+    // Electron on Linux leaks non-CLOEXEC fds into children; close them before
+    // exec so the long-lived server does not hold the caller's pipes open.
+    const server = path.join(__dirname, '..', 'dashboard-server.cjs');
+    const closeFds = 'for f in /proc/$$/fd/*; do n=${f##*/}; [ "$n" -gt 2 ] && eval "exec $n>&-"; done 2>/dev/null; exec "$0" "$@"';
+    const child = spawn('bash', ['-c', closeFds, process.execPath, server, process.env.FAKE_DASHBOARD_PORT, ROOT], { detached: true, stdio: 'ignore' });
     child.unref();
     fs.writeFileSync(pidFile, String(child.pid));
   }
