@@ -19,11 +19,12 @@ const STOP_SUPPRESS_MS = 15000; // ignore a name for 15s after a manual stop
 function createGatewayWatchdog(deps) {
   const {
     listProfiles, // () => Promise<{ ok, profiles:[{name,running,...}] }>
-    startProfile, // (name) => Promise<{ ok }>
+    startProfile, // (name) => Promise<{ ok, error? }> — ok only once confirmed running
     getConfig, // () => { autoRestartEnabled, autoRestartMax }
     onEvent, // ({ type, name, ... }) => void
     onProfiles, // ({ profiles, at }) => void
     notify, // ({ title, body }) => void
+    isBusy = () => false, // (name) => true while a start/stop/restart is in flight
     pollMs = DEFAULT_POLL_MS
   } = deps;
 
@@ -53,10 +54,12 @@ function createGatewayWatchdog(deps) {
 
       if (typeof onProfiles === 'function') onProfiles({ profiles, at: nowTs });
 
-      // Crash detection: was up last poll, desired, now down, not just-stopped.
+      // Crash detection: was up last poll, desired, now down, not just-stopped,
+      // and not in the middle of a controller-driven stop/start (a restart is
+      // briefly "down" between its stop and its confirmed start).
       if (lastRunning) {
         for (const name of lastRunning) {
-          if (!running.has(name) && desired.has(name) && !isSuppressed(name, nowTs)) {
+          if (!running.has(name) && desired.has(name) && !isSuppressed(name, nowTs) && !isBusy(name)) {
             handleCrash(name);
           }
         }
@@ -68,7 +71,13 @@ function createGatewayWatchdog(deps) {
         if (!isSuppressed(name, nowTs)) desired.add(name);
       }
 
-      lastRunning = running;
+      // A busy name keeps its last known state so the transition is judged
+      // against the state before it started.
+      const nextRunning = new Set(running);
+      if (lastRunning) {
+        for (const name of lastRunning) if (isBusy(name)) nextRunning.add(name);
+      }
+      lastRunning = nextRunning;
     } finally {
       polling = false;
     }
@@ -104,7 +113,7 @@ function createGatewayWatchdog(deps) {
         if (typeof onEvent === 'function') onEvent({ type: 'restarted', name, attempt: r.count, max });
         if (typeof notify === 'function') notify({ title: '게이트웨이 자동 재시작', body: `${name} (시도 ${r.count}/${max})` });
       } else {
-        if (typeof onEvent === 'function') onEvent({ type: 'restart-failed', name, reason: (result && result.output) || 'start failed' });
+        if (typeof onEvent === 'function') onEvent({ type: 'restart-failed', name, reason: (result && (result.error || result.output)) || 'start failed' });
       }
     } catch (error) {
       if (typeof onEvent === 'function') onEvent({ type: 'restart-failed', name, reason: String(error && error.message ? error.message : error) });
