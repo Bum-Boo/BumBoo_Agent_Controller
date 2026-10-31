@@ -33,6 +33,10 @@ function createGatewayLifecycle(deps) {
   } = deps;
 
   const entries = new Map(); // name -> entry
+  // Names with an operation in flight. Reserved synchronously, before the
+  // first await, so a request that arrives while restart() is still checking
+  // the current state cannot slip past the busy guard.
+  const inFlight = new Set();
 
   function get(name) {
     return entries.get(name) || { name, phase: 'idle', action: null, error: '', detail: '', since: null };
@@ -54,7 +58,7 @@ function createGatewayLifecycle(deps) {
   }
 
   function isBusy(name) {
-    return TRANSITIONAL.has(get(name).phase);
+    return inFlight.has(name) || TRANSITIONAL.has(get(name).phase);
   }
 
   async function isRunning(name) {
@@ -127,9 +131,21 @@ function createGatewayLifecycle(deps) {
   function guard(name) {
     if (isBusy(name)) {
       const entry = get(name);
-      return { ok: false, busy: true, ...entry, error: `already ${entry.phase}` };
+      return { ok: false, busy: true, ...entry, error: `already ${TRANSITIONAL.has(entry.phase) ? entry.phase : 'busy'}` };
     }
     return null;
+  }
+
+  // Run one operation for `name` exclusively; a concurrent one gets `busy`.
+  async function exclusive(name, op) {
+    const busy = guard(name);
+    if (busy) return busy;
+    inFlight.add(name);
+    try {
+      return await op();
+    } finally {
+      inFlight.delete(name);
+    }
   }
 
   return {
@@ -140,27 +156,27 @@ function createGatewayLifecycle(deps) {
       for (const [name, entry] of entries) out[name] = { ...entry };
       return out;
     },
-    async start(name) {
-      return guard(name) || result(await doStart(name, 'start'));
+    start(name) {
+      return exclusive(name, async () => result(await doStart(name, 'start')));
     },
-    async stop(name) {
-      return guard(name) || result(await doStop(name, 'stop'));
+    stop(name) {
+      return exclusive(name, async () => result(await doStop(name, 'stop')));
     },
-    async restart(name) {
-      const busy = guard(name);
-      if (busy) return busy;
-      const running = await isRunning(name);
-      if (running !== false) {
-        const stopped = await doStop(name, 'restart');
-        if (stopped.phase !== 'stopped') return result(stopped);
-      }
-      return result(await doStart(name, 'restart'));
+    restart(name) {
+      return exclusive(name, async () => {
+        const running = await isRunning(name);
+        if (running !== false) {
+          const stopped = await doStop(name, 'restart');
+          if (stopped.phase !== 'stopped') return result(stopped);
+        }
+        return result(await doStart(name, 'restart'));
+      });
     },
     // Reconcile resting phases with an observed profile list.
     observe(profiles) {
       for (const p of profiles || []) {
         const entry = get(p.name);
-        if (TRANSITIONAL.has(entry.phase)) continue;
+        if (inFlight.has(p.name) || TRANSITIONAL.has(entry.phase)) continue;
         if (p.running && entry.phase !== 'running') {
           set(p.name, { phase: 'running', action: entry.action, error: '', detail: '' });
         } else if (!p.running && entry.phase === 'running') {

@@ -154,6 +154,36 @@ test('a second request while transitioning is rejected as busy', async () => {
   assert.equal(lc.isBusy('alpha'), false);
 });
 
+test('restart is busy from the first await: a concurrent start/restart is rejected (regression)', async () => {
+  // restart() used to check busy, then await the "is it running?" listing
+  // before entering a transitional phase, so a second request issued during
+  // that listing passed the guard and both drove the gateway at once.
+  let releaseList;
+  let starts = 0;
+  let lists = 0;
+  const lc = createGatewayLifecycle({
+    startProfile: async () => { starts += 1; return { ok: true }; },
+    stopProfile: async () => ({ ok: true }),
+    listProfiles: () => {
+      lists += 1;
+      if (lists === 1) return new Promise((r) => { releaseList = () => r({ ok: true, profiles: [{ name: 'alpha', running: false }] }); });
+      return Promise.resolve({ ok: true, profiles: [{ name: 'alpha', running: true }] });
+    },
+    sleep: async () => {}
+  });
+  const first = lc.restart('alpha');
+  await new Promise((r) => setImmediate(r));
+  assert.equal(lc.isBusy('alpha'), true, 'restart is busy while it checks the current state');
+  const second = await lc.start('alpha');
+  assert.equal(second.busy, true);
+  const third = await lc.restart('alpha');
+  assert.equal(third.busy, true);
+  releaseList();
+  const res = await first;
+  assert.equal(res.phase, 'running');
+  assert.equal(starts, 1, 'only one start command was sent');
+});
+
 test('observe(): external start, crash and recovery update resting phases only', async () => {
   const { lc } = scripted();
   lc.observe([{ name: 'alpha', running: true }]);
