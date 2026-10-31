@@ -72,6 +72,25 @@ test('stop: reports incomplete when WSL keeps running', async () => {
   await service.stop();
 });
 
+test('stop: a wsl -d call racing the terminate does not leave WSL running (regression)', async () => {
+  await service.start();
+  let raced = false;
+  const racy = makeService({
+    run: async (file, args, t) => {
+      const res = await run(file, args, t);
+      if (args[0] === '--terminate' && !raced) {
+        raced = true; // a background poll that was already in flight boots it again
+        await run(file, ['-d', config.distro, '--', 'bash', '-lc', 'true'], t);
+      }
+      return res;
+    }
+  });
+  const status = await racy.stop();
+  assert.equal(raced, true);
+  assert.equal(status.outcome, 'stopped', status.error);
+  assert.equal(status.wslRunning, false);
+});
+
 test('start: not logged in -> timeout with a reason, never "running" (regression)', async () => {
   // The old check matched /logged in/ and so treated "not logged in" as logged in.
   fake.setLoggedIn(false);

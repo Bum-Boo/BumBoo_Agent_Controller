@@ -16,6 +16,9 @@ contextBridge.exposeInMainWorld('hermes', {
   detectControllerEnvironment: () => ipcRenderer.invoke('hermes:detectControllerEnvironment'),
   testControllerConfig: (patch) => ipcRenderer.invoke('hermes:testControllerConfig', patch),
   updateControllerConfig: (patch) => ipcRenderer.invoke('hermes:updateControllerConfig', patch),
+  listSettingsBackups: () => ipcRenderer.invoke('hermes:listSettingsBackups'),
+  createSettingsBackup: () => ipcRenderer.invoke('hermes:createSettingsBackup'),
+  restoreSettingsBackup: (id) => ipcRenderer.invoke('hermes:restoreSettingsBackup', id),
 
   // Power / mode
   getMode: () => ipcRenderer.invoke('hermes:getMode'),
@@ -34,6 +37,8 @@ contextBridge.exposeInMainWorld('hermes', {
   useProfile: (name) => ipcRenderer.invoke('hermes:useProfile', name),
   gatewayStart: (name) => ipcRenderer.invoke('hermes:gatewayStart', name),
   gatewayStop: (name) => ipcRenderer.invoke('hermes:gatewayStop', name),
+  gatewayRestart: (name) => ipcRenderer.invoke('hermes:gatewayRestart', name),
+  getGatewayPhases: () => ipcRenderer.invoke('hermes:getGatewayPhases'),
 
   // Diagnostics
   getDiagnostics: () => ipcRenderer.invoke('hermes:getDiagnostics'),
@@ -81,6 +86,11 @@ contextBridge.exposeInMainWorld('hermes', {
     const listener = (_event, payload) => callback(payload);
     ipcRenderer.on('hermes:profilesUpdated', listener);
     return () => ipcRenderer.removeListener('hermes:profilesUpdated', listener);
+  },
+  onGatewayPhase: (callback) => {
+    const listener = (_event, payload) => callback(payload);
+    ipcRenderer.on('hermes:gatewayPhase', listener);
+    return () => ipcRenderer.removeListener('hermes:gatewayPhase', listener);
   },
   onGatewayEvent: (callback) => {
     const listener = (_event, payload) => callback(payload);

@@ -118,10 +118,12 @@ function createServiceControl(deps) {
   }
 
   // Poll `probe` until `done(status)` or the deadline; returns the last status.
-  async function waitForStatus(probe, done, timeoutMs) {
+  // `retry(status)` runs before each wait while not done (e.g. re-terminate).
+  async function waitForStatus(probe, done, timeoutMs, retry = null) {
     const deadline = Date.now() + timeoutMs;
     let status = await probe();
     while (!done(status) && Date.now() < deadline) {
+      if (retry) await retry(status);
       await sleep(pollMs);
       status = await probe();
     }
@@ -154,7 +156,11 @@ function createServiceControl(deps) {
     await runPowerShell(`Stop-ScheduledTask -TaskName "${cfg.dashboardTaskName}"`, 10000);
     await runWsl(`systemctl --user stop hermes-dashboard.service >/dev/null 2>&1 || true; ${hermesEnvPrefix(cfg)}${shellQuote(cfg.hermesCommand)} gateway stop >/dev/null 2>&1 || systemctl --user stop hermes-gateway.service >/dev/null 2>&1 || true`, 15000);
     await run(wslPath(), ['--terminate', cfg.distro], 15000);
-    const status = await waitForStatus(publish, (s) => !s.wslRunning && !s.dashboardOnline, stopTimeoutMs);
+    // Any `wsl -d` call still in flight (a background poll) boots the distro
+    // again right after the terminate, so terminate again while it is up.
+    const status = await waitForStatus(publish, (s) => !s.wslRunning && !s.dashboardOnline, stopTimeoutMs, async (s) => {
+      if (s.wslRunning) await run(wslPath(), ['--terminate', cfg.distro], 15000);
+    });
     const outcome = !status.wslRunning && !status.dashboardOnline ? 'stopped' : 'incomplete';
     const error = outcome === 'stopped' ? '' : [status.wslRunning ? 'WSL distro still running' : '', status.dashboardOnline ? 'dashboard still answering' : ''].filter(Boolean).join('; ');
     return { ...status, outcome, error };
@@ -167,7 +173,9 @@ function createServiceControl(deps) {
     await runPowerShell(`Stop-ScheduledTask -TaskName "${cfg.dashboardTaskName}"`, 10000);
     await runWsl(`${hermesEnvPrefix(cfg)}${shellQuote(cfg.hermesCommand)} gateway stop >/dev/null 2>&1 || true`, 12000);
     await run(wslPath(), ['--shutdown'], 25000);
-    const status = await waitForStatus(publish, (s) => !s.wslRunning, stopTimeoutMs);
+    const status = await waitForStatus(publish, (s) => !s.wslRunning, stopTimeoutMs, async (s) => {
+      if (s.wslRunning) await run(wslPath(), ['--shutdown'], 25000);
+    });
     return { ...status, outcome: status.wslRunning ? 'incomplete' : 'stopped' };
   }
 

@@ -117,7 +117,9 @@ function createSettingsStore(deps) {
       if (files[key] === null || files[key] === undefined) {
         // "Did not exist" in the bundle: remove the file and its .bak so the
         // reader falls back to defaults (the pre-restore bundle keeps both).
-        for (const f of [file, `${file}.bak`]) if (fs.existsSync(f)) fs.unlinkSync(f);
+        for (const f of [file, `${file}.bak`]) {
+          if (fs.existsSync(f) && fs.statSync(f).isFile()) fs.unlinkSync(f);
+        }
       } else {
         writeJsonAtomic(file, files[key], fs);
       }

@@ -2,7 +2,6 @@ const { app, BrowserWindow, Tray, Menu, nativeImage, ipcMain, shell, dialog, Not
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const http = require('node:http');
 
 const power = require('./power.cjs');
 const { wslPath, shellQuote, run, createWslRunner } = require('./shell.cjs');
@@ -10,7 +9,12 @@ const { createHermesAdapter } = require('./hermes-adapter.cjs');
 const { createModeManager } = require('./mode-manager.cjs');
 const { createGatewayWatchdog } = require('./gateway-watchdog.cjs');
 const { createLogStreamer } = require('./log-streamer.cjs');
-const { loadControllerConfig, saveControllerConfig, publicConfig } = require('./runtime-config.cjs');
+const { loadControllerConfig, saveControllerConfig, publicConfig, normalizeConfig } = require('./runtime-config.cjs');
+const { SETTINGS_DEFAULTS, normalizeSettings, applySettingsPatch } = require('./app-settings.cjs');
+const { createSettingsStore } = require('./settings-store.cjs');
+const { createServiceControl } = require('./service-control.cjs');
+const { createGatewayLifecycle } = require('./gateway-lifecycle.cjs');
+const { validName } = require('./hermes-adapter.cjs');
 
 app.disableHardwareAcceleration();
 
@@ -18,19 +22,6 @@ const ROOT = path.resolve(__dirname, '..');
 const HELPER_PS1 = path.join(__dirname, 'powercfg-helper.ps1');
 let CONFIG = null;
 
-const SETTINGS_DEFAULTS = {
-  language: 'ko',
-  // Power / server-mode settings
-  autoServerEnabled: true,
-  idleThresholdMinutes: 20,
-  serverCpuMax: 70,
-  turnOffDisplayOnServer: true,
-  serverPlanGuid: '',
-  // Gateway watchdog
-  autoRestartEnabled: false,
-  autoRestartMax: 3
-};
-const SUPPORTED_LANGUAGES = new Set(['ko', 'zh', 'ja', 'en']);
 const STARTUP_SHORTCUT_NAME = 'Hermes Lab Controller.lnk';
 
 let mainWindow = null;
@@ -43,17 +34,16 @@ let watchdog = null;
 let logStreamer = null;
 let currentStatus = null;
 let currentMode = null;
+let lifecycle = null;
+// Set while the user has stopped the whole stack: background polls stay out
+// of WSL until the user starts something again.
+let stackHold = false;
+let settingsStore = null;
 
 function sendToWindow(channel, payload) {
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send(channel, payload);
   }
-}
-
-function hermesEnvPrefix() {
-  const cd = CONFIG.labRoot ? `cd ${shellQuote(CONFIG.labRoot)} && ` : '';
-  const home = CONFIG.hermesHome ? `HERMES_HOME=${shellQuote(CONFIG.hermesHome)} ` : '';
-  return `${cd}${home}`;
 }
 
 function runPowerShell(command, timeoutMs = 10000) {
@@ -62,61 +52,56 @@ function runPowerShell(command, timeoutMs = 10000) {
 
 const runWsl = createWslRunner(() => CONFIG);
 
+const service = createServiceControl({
+  getConfig: () => CONFIG,
+  run,
+  runWsl,
+  runPowerShell,
+  wslPath
+});
+
 function psSingleQuote(value) {
   return String(value).replace(/'/g, "''");
 }
 
-function settingsPath() {
-  return path.join(app.getPath('userData'), 'settings.json');
-}
-
-function clampInt(value, min, max, fallback) {
-  const n = Math.round(Number(value));
-  if (!Number.isFinite(n)) return fallback;
-  return Math.max(min, Math.min(max, n));
-}
-
-function normalizeSettings(raw) {
-  const base = { ...SETTINGS_DEFAULTS, ...(raw || {}) };
-  return {
-    language: SUPPORTED_LANGUAGES.has(base.language) ? base.language : SETTINGS_DEFAULTS.language,
-    autoServerEnabled: base.autoServerEnabled !== false,
-    idleThresholdMinutes: clampInt(base.idleThresholdMinutes, 1, 240, SETTINGS_DEFAULTS.idleThresholdMinutes),
-    serverCpuMax: clampInt(base.serverCpuMax, 20, 100, SETTINGS_DEFAULTS.serverCpuMax),
-    turnOffDisplayOnServer: base.turnOffDisplayOnServer !== false,
-    serverPlanGuid: typeof base.serverPlanGuid === 'string' ? base.serverPlanGuid : '',
-    autoRestartEnabled: base.autoRestartEnabled === true,
-    autoRestartMax: clampInt(base.autoRestartMax, 1, 10, SETTINGS_DEFAULTS.autoRestartMax)
-  };
+function store() {
+  if (!settingsStore) {
+    settingsStore = createSettingsStore({
+      dir: app.getPath('userData'),
+      validators: {
+        settings: (value) => normalizeSettings(value),
+        controllerConfig: (value) => {
+          const cfg = normalizeConfig(value);
+          return {
+            distro: cfg.distro,
+            dashboardUrl: cfg.dashboardUrl,
+            dashboardTaskName: cfg.dashboardTaskName,
+            labRoot: cfg.labRoot,
+            hermesHome: cfg.hermesHome,
+            hermesCommand: cfg.hermesCommand,
+            pollMs: cfg.pollMs
+          };
+        }
+      }
+    });
+  }
+  return settingsStore;
 }
 
 function readSettings() {
-  try {
-    return normalizeSettings(JSON.parse(fs.readFileSync(settingsPath(), 'utf8')));
-  } catch {
-    return { ...SETTINGS_DEFAULTS };
-  }
+  const { value, source } = store().read('settings', null);
+  return source === 'default' ? { ...SETTINGS_DEFAULTS } : normalizeSettings(value);
 }
 
 function writeSettings(nextSettings) {
-  const normalized = normalizeSettings(nextSettings);
-  fs.mkdirSync(app.getPath('userData'), { recursive: true });
-  fs.writeFileSync(settingsPath(), JSON.stringify(normalized, null, 2));
-  return normalized;
+  return store().write('settings', normalizeSettings(nextSettings));
 }
 
 // Profile labels: user-assigned display names + descriptions per profile.
 // Stored in userData/profile-labels.json as { [technicalName]: { label, desc } }.
-function profileLabelsPath() {
-  return path.join(app.getPath('userData'), 'profile-labels.json');
-}
-
 function readProfileLabels() {
-  try {
-    const raw = JSON.parse(fs.readFileSync(profileLabelsPath(), 'utf8'));
-    if (raw && typeof raw === 'object' && !Array.isArray(raw)) return raw;
-  } catch { /* file missing or corrupt → return empty */ }
-  return {};
+  const { value } = store().read('profileLabels', {});
+  return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
 }
 
 function writeProfileLabel(name, label, desc) {
@@ -128,9 +113,7 @@ function writeProfileLabel(name, label, desc) {
   } else {
     labels[name] = { label: trimLabel, desc: trimDesc };
   }
-  fs.mkdirSync(app.getPath('userData'), { recursive: true });
-  fs.writeFileSync(profileLabelsPath(), JSON.stringify(labels, null, 2));
-  return labels;
+  return store().write('profileLabels', labels);
 }
 
 
@@ -330,13 +313,7 @@ async function getAppSettings() {
 
 async function updateAppSettings(patch = {}) {
   const before = readSettings();
-  const next = { ...before };
-  if (typeof patch.language === 'string') next.language = patch.language;
-  if (typeof patch.autoServerEnabled === 'boolean') next.autoServerEnabled = patch.autoServerEnabled;
-  if (typeof patch.turnOffDisplayOnServer === 'boolean') next.turnOffDisplayOnServer = patch.turnOffDisplayOnServer;
-  if (patch.idleThresholdMinutes !== undefined) next.idleThresholdMinutes = patch.idleThresholdMinutes;
-  if (patch.serverCpuMax !== undefined) next.serverCpuMax = patch.serverCpuMax;
-  writeSettings(next);
+  writeSettings(applySettingsPatch(before, patch || {}));
 
   if (typeof patch.startupEnabled === 'boolean') {
     await setStartupEnabled(patch.startupEnabled);
@@ -355,64 +332,8 @@ async function updateAppSettings(patch = {}) {
   return settings;
 }
 
-function checkHttp(url, timeoutMs = 3000) {
-  return new Promise((resolve) => {
-    const request = http.get(url, { timeout: timeoutMs }, (response) => {
-      response.resume();
-      resolve(response.statusCode === 200);
-    });
-    request.on('timeout', () => {
-      request.destroy();
-      resolve(false);
-    });
-    request.on('error', () => resolve(false));
-  });
-}
-
-async function isWslRunning() {
-  const result = await run(wslPath(), ['-l', '-v'], 6000);
-  const text = `${result.stdout}\n${result.stderr}`.replace(/\0/g, '');
-  return new RegExp(`^\\s*\\*?\\s*${CONFIG.distro}\\s+Running\\s+2\\s*$`, 'm').test(text);
-}
-
-async function getGatewayStatus(wslRunning) {
-  if (!wslRunning) return 'WSL off';
-  const result = await runWsl('systemctl --user is-active hermes-gateway.service 2>/dev/null || true', 8000);
-  const value = result.stdout.trim();
-  return value || 'unknown';
-}
-
-async function getAuthStatus(wslRunning) {
-  if (!wslRunning) return 'WSL off';
-  const cmd = `${hermesEnvPrefix()}${shellQuote(CONFIG.hermesCommand)} auth status openai-codex 2>&1 | head -n 1`;
-  const result = await runWsl(cmd, 12000);
-  const value = result.stdout.trim();
-  if (/logged in/i.test(value)) return 'logged in';
-  return value || 'unknown';
-}
-
-async function getStatus() {
-  const [wslRunning, dashboardOnline] = await Promise.all([
-    isWslRunning(),
-    checkHttp(CONFIG.dashboardUrl)
-  ]);
-  const [gateway, codexAuth] = await Promise.all([
-    getGatewayStatus(wslRunning),
-    getAuthStatus(wslRunning)
-  ]);
-  const ready = Boolean(wslRunning && dashboardOnline && codexAuth === 'logged in');
-  return {
-    wslRunning,
-    dashboardOnline,
-    gateway,
-    codexAuth,
-    ready,
-    checkedAt: new Date().toISOString()
-  };
-}
-
 async function publishStatus({ notify = false } = {}) {
-  const status = await getStatus();
+  const status = await service.getStatus();
   currentStatus = status;
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send('hermes:statusChanged', status);
@@ -428,37 +349,43 @@ async function publishStatus({ notify = false } = {}) {
   return status;
 }
 
+// A whole-stack stop takes every gateway down on purpose: forget them so the
+// watchdog does not report them as crashed once WSL is back.
+function forgetDesiredGateways() {
+  stackHold = true;
+  if (!watchdog) return;
+  for (const name of watchdog.getState().desired) watchdog.setDesired(name, false);
+}
+
 async function startHermes() {
-  await runPowerShell(`Start-ScheduledTask -TaskName "${CONFIG.dashboardTaskName}"`, 10000);
-  await new Promise((resolve) => setTimeout(resolve, 3000));
-  await runWsl(`${hermesEnvPrefix()}${shellQuote(CONFIG.hermesCommand)} gateway status >/dev/null 2>&1 || true`, 12000);
-  const status = await publishStatus({ notify: true });
-  new Notification({ title: 'Hermes Lab', body: 'Start command sent.' }).show();
+  stackHold = false;
+  const status = await service.start({ publish: () => publishStatus({ notify: false }) });
+  lastReady = status.ready;
+  const body = status.outcome === 'running'
+    ? 'Hermes is running.'
+    : `Start did not complete (${status.outcome}): ${status.error}`;
+  new Notification({ title: 'Hermes Lab', body }).show();
   return status;
 }
 
 async function stopHermes() {
-  await runPowerShell(`Stop-ScheduledTask -TaskName "${CONFIG.dashboardTaskName}"`, 10000);
-  await runWsl(`systemctl --user stop hermes-dashboard.service >/dev/null 2>&1 || true; HERMES_HOME=${shellQuote(CONFIG.hermesHome)} ${shellQuote(CONFIG.hermesCommand)} gateway stop >/dev/null 2>&1 || systemctl --user stop hermes-gateway.service >/dev/null 2>&1 || true`, 15000);
-  await run(wslPath(), ['--terminate', CONFIG.distro], 15000);
-  await new Promise((resolve) => setTimeout(resolve, 2000));
-  const status = await publishStatus({ notify: true });
-  new Notification({ title: 'Hermes Lab', body: 'Hermes and WSL Ubuntu were stopped.' }).show();
+  forgetDesiredGateways();
+  const status = await service.stop({ publish: () => publishStatus({ notify: false }) });
+  lastReady = status.ready;
+  const body = status.outcome === 'stopped'
+    ? 'Hermes and the WSL distro were stopped.'
+    : `Stop did not complete: ${status.error}`;
+  new Notification({ title: 'Hermes Lab', body }).show();
   return status;
 }
 
 // Full WSL shutdown: `wsl --shutdown` stops the entire WSL2 backend VM (every
 // distro + the utility VM), releasing all of its RAM — heavier than stopHermes,
-// which only terminates the Ubuntu distro. Stops the gateways first so they get
-// a chance to finalize sessions instead of being hard-killed mid-write.
+// which only terminates the configured distro.
 async function shutdownWsl() {
-  await runPowerShell(`Stop-ScheduledTask -TaskName "${CONFIG.dashboardTaskName}"`, 10000).catch(() => {});
-  // Best-effort graceful gateway stop before pulling the VM out from under them.
-  await runWsl(`HERMES_HOME=${shellQuote(CONFIG.hermesHome)} ${shellQuote(CONFIG.hermesCommand)} gateway stop >/dev/null 2>&1 || true`, 12000).catch(() => {});
-  await run(wslPath(), ['--shutdown'], 25000);
-  await new Promise((resolve) => setTimeout(resolve, 2000));
-  const status = await publishStatus({ notify: true });
-  new Notification({ title: 'WSL', body: 'WSL을 완전히 종료했습니다. 메모리가 해제됩니다.' }).show();
+  forgetDesiredGateways();
+  const status = await service.shutdownWsl({ publish: () => publishStatus({ notify: false }) });
+  new Notification({ title: 'WSL', body: status.outcome === 'stopped' ? 'WSL을 완전히 종료했습니다. 메모리가 해제됩니다.' : 'WSL 종료가 확인되지 않았습니다.' }).show();
   return status;
 }
 
@@ -583,59 +510,6 @@ function createWindow() {
 }
 
 
-async function detectControllerEnvironment() {
-  const list = await run(wslPath(), ['-l', '-q'], 8000);
-  const distros = (list.stdout || '')
-    .replace(/ /g, '')
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .filter((line) => !/docker-desktop/i.test(line));
-  const candidates = [];
-  for (const distro of distros.slice(0, 8)) {
-    const script = `python3 - <<'PY'
-import json, os, shutil
-from pathlib import Path
-home = Path.home()
-cmd = shutil.which('hermes') or 'hermes'
-paths = []
-for p in [Path(os.environ.get('HERMES_HOME','')), home/'.hermes', home/'hermes-lab'/'.hermes']:
-    if str(p) and p.exists() and (p/'profiles').exists():
-        paths.append(str(p))
-roots = []
-for p in [home/'hermes-lab', home/'workspace'/'hermes-lab', home]:
-    if p.exists(): roots.append(str(p))
-print(json.dumps({'hermesCommand': cmd, 'hermesHomes': paths, 'labRoots': roots}, ensure_ascii=False))
-PY`;
-    const res = await run(wslPath(), ['-d', distro, '--', 'bash', '-lc', script], 10000);
-    let info = {};
-    try { info = JSON.parse(res.stdout || '{}'); } catch { info = {}; }
-    candidates.push({ distro, ok: res.ok, ...info });
-  }
-  return { ok: true, distros, candidates };
-}
-
-async function testControllerConfig(patch = null) {
-  const cfg = patch ? { ...CONFIG, ...patch } : CONFIG;
-  const checks = [];
-  const runIn = (script, timeout = 12000) => run(wslPath(), ['-d', cfg.distro || 'Ubuntu', '--', 'bash', '-lc', script], timeout);
-  const hermesCommand = shellQuote(cfg.hermesCommand || 'hermes');
-  const hermesHome = shellQuote(cfg.hermesHome || '');
-  const labRoot = shellQuote(cfg.labRoot || '');
-  let res = await run(wslPath(), ['-l', '-q'], 8000);
-  const distroFound = (res.stdout || '').replace(/ /g, '').split(/\r?\n/).map((x) => x.trim()).includes(cfg.distro);
-  checks.push({ name: 'wsl.distro', ok: distroFound, detail: cfg.distro || '' });
-  res = await runIn(`command -v ${hermesCommand}`, 8000);
-  checks.push({ name: 'hermes.command', ok: res.ok && Boolean(res.stdout.trim()), detail: (res.stdout || res.stderr || '').trim().split(/\r?\n/)[0] || cfg.hermesCommand });
-  res = await runIn(`test -d ${hermesHome} && test -d ${hermesHome}/profiles`, 8000);
-  checks.push({ name: 'hermes.home', ok: res.ok, detail: cfg.hermesHome || '' });
-  res = await runIn(`test -d ${labRoot}`, 8000);
-  checks.push({ name: 'lab.root', ok: res.ok, detail: cfg.labRoot || '' });
-  res = await runIn(`cd ${labRoot} && HERMES_HOME=${hermesHome} ${hermesCommand} profile list >/tmp/hermes-controller-profile-list.txt 2>&1`, 15000);
-  checks.push({ name: 'hermes.profile_list', ok: res.ok, detail: res.ok ? 'ok' : (res.stderr || res.stdout || '').trim().slice(0, 300) });
-  return { ok: checks.every((c) => c.ok), checks, config: publicConfig(cfg) };
-}
-
 function applyControllerConfig(next) {
   CONFIG = next;
   if (adapter) adapter = createHermesAdapter(runWsl, CONFIG);
@@ -695,13 +569,51 @@ ipcMain.handle('hermes:openLabFolder', () => shell.openPath(CONFIG.labUnc));
 ipcMain.handle('hermes:getSettings', () => getAppSettings());
 ipcMain.handle('hermes:updateSettings', (_event, patch) => updateAppSettings(patch));
 ipcMain.handle('hermes:getControllerConfig', () => publicConfig(CONFIG));
-ipcMain.handle('hermes:detectControllerEnvironment', () => detectControllerEnvironment());
-ipcMain.handle('hermes:testControllerConfig', (_event, patch) => testControllerConfig(patch));
+ipcMain.handle('hermes:detectControllerEnvironment', () => service.detectControllerEnvironment());
+ipcMain.handle('hermes:testControllerConfig', (_event, patch) => service.testControllerConfig(patch));
 ipcMain.handle('hermes:updateControllerConfig', async (_event, patch) => {
-  const next = saveControllerConfig(app.getPath('userData'), patch || {});
-  applyControllerConfig(next);
+  const previous = CONFIG;
+  try {
+    // Save + apply as one step: if applying throws, the previous file and
+    // the previous in-memory config are both put back.
+    store().transaction(() => {
+      const next = saveControllerConfig(app.getPath('userData'), patch || {});
+      applyControllerConfig(next);
+    });
+  } catch (error) {
+    applyControllerConfig(previous);
+    return { ok: false, error: `설정 저장 실패, 이전 설정으로 복구함: ${error.message}`, config: publicConfig(CONFIG) };
+  }
   const status = await publishStatus({ notify: false });
   return { ok: true, config: publicConfig(CONFIG), status };
+});
+
+// --- controller settings backup / restore -----------------------------------
+
+ipcMain.handle('hermes:listSettingsBackups', () => store().listBackups());
+ipcMain.handle('hermes:createSettingsBackup', () => {
+  try { return store().createBackup('manual'); } catch (error) { return { ok: false, error: error.message }; }
+});
+ipcMain.handle('hermes:restoreSettingsBackup', async (_event, id) => {
+  const before = readSettings();
+  const previousConfig = CONFIG;
+  const res = store().restoreBackup(id);
+  if (!res.ok) return res;
+  try {
+    applyControllerConfig(loadControllerConfig(app.getPath('userData')));
+    const after = readSettings();
+    if (modeManager && (after.serverCpuMax !== before.serverCpuMax || after.idleThresholdMinutes !== before.idleThresholdMinutes)) {
+      await modeManager.refreshConfig();
+    }
+  } catch (error) {
+    // Applying the restored settings failed: go back to what we had.
+    if (res.preRestoreId) store().restoreBackup(res.preRestoreId);
+    applyControllerConfig(previousConfig);
+    return { ok: false, error: `복원한 설정 적용 실패, 이전 설정으로 복구함: ${error.message}`, rolledBack: true };
+  }
+  const settings = await getAppSettings();
+  sendToWindow('hermes:settingsChanged', settings);
+  return { ...res, settings, config: publicConfig(CONFIG), labels: readProfileLabels() };
 });
 
 ipcMain.handle('hermes:getMode', () => (modeManager ? modeManager.getState() : null));
@@ -709,7 +621,12 @@ ipcMain.handle('hermes:enterServerMode', () => (modeManager ? modeManager.enterS
 ipcMain.handle('hermes:exitServerMode', () => (modeManager ? modeManager.exitServerMode() : null));
 ipcMain.handle('hermes:getModeHistory', () => (modeManager ? modeManager.getHistory() : []));
 
-ipcMain.handle('hermes:getProfiles', () => (adapter ? adapter.listProfiles() : { ok: false, profiles: [] }));
+ipcMain.handle('hermes:getProfiles', async () => {
+  if (!adapter) return { ok: false, profiles: [] };
+  const res = await adapter.listProfiles();
+  if (res && res.ok && lifecycle) lifecycle.observe(res.profiles);
+  return res;
+});
 ipcMain.handle('hermes:getModelOptions', () => (adapter ? adapter.modelOptions() : { ok: false, models: [], reasoning: [] }));
 ipcMain.handle('hermes:setProfileModelSettings', (_event, name, patch) => setProfileModelSettings(name, patch));
 ipcMain.handle('hermes:getProfileOpsState', () => getProfileOpsState());
@@ -718,26 +635,34 @@ ipcMain.handle('hermes:restoreProfileBackup', (_event, name, backupId) => restor
 ipcMain.handle('hermes:getProfileLogSummary', (_event, name) => (adapter ? adapter.profileLogSummary(name) : { ok: false }));
 ipcMain.handle('hermes:useProfile', (_event, name) => (adapter ? adapter.useProfile(name) : { ok: false }));
 
-ipcMain.handle('hermes:gatewayStart', async (_event, name) => {
-  if (!adapter) return { ok: false };
-  if (watchdog) watchdog.setDesired(name, true); // mark intent before acting
-  const result = await adapter.gatewayStartProfile(name);
-  if (result && result.ok !== false) {
-    clearProfileRestartNeeded(name);
-    appendProfileChangeHistory({ profile: name, action: 'gateway.start' });
+// Gateway start/stop/restart resolve only once the process state is confirmed
+// (or failed); intermediate phases are pushed as hermes:gatewayPhase events.
+async function runGatewayAction(action, name) {
+  if (!adapter || !lifecycle) return { ok: false, phase: 'failed', error: 'adapter not ready' };
+  if (!validName(name)) return { ok: false, phase: 'failed', error: 'invalid profile name' };
+  if (action !== 'stop') stackHold = false; // the user wants WSL up again
+  if (watchdog) watchdog.setDesired(name, action !== 'stop'); // mark intent before acting
+  const result = await lifecycle[action](name);
+  if (result.busy) return result;
+  if (action !== 'stop') {
+    if (result.ok) clearProfileRestartNeeded(name);
+    // A start the user saw fail is not a gateway the watchdog should revive.
+    else if (watchdog) watchdog.setDesired(name, false);
   }
-  if (watchdog) setTimeout(() => watchdog.refreshNow(), 2500); // let it settle, then re-poll
-  return result;
-});
-
-ipcMain.handle('hermes:gatewayStop', async (_event, name) => {
-  if (!adapter) return { ok: false };
-  if (watchdog) watchdog.setDesired(name, false); // suppress crash detection for this stop
-  const result = await adapter.gatewayStopProfile(name);
-  if (result && result.ok !== false) appendProfileChangeHistory({ profile: name, action: 'gateway.stop' });
+  appendProfileChangeHistory({
+    profile: name,
+    action: `gateway.${action}`,
+    outcome: result.phase,
+    ...(result.ok ? {} : { error: result.error })
+  });
   if (watchdog) watchdog.refreshNow();
   return result;
-});
+}
+
+ipcMain.handle('hermes:gatewayStart', (_event, name) => runGatewayAction('start', name));
+ipcMain.handle('hermes:gatewayStop', (_event, name) => runGatewayAction('stop', name));
+ipcMain.handle('hermes:gatewayRestart', (_event, name) => runGatewayAction('restart', name));
+ipcMain.handle('hermes:getGatewayPhases', () => (lifecycle ? lifecycle.snapshot() : {}));
 
 ipcMain.handle('hermes:getDiagnostics', () => getDiagnostics());
 ipcMain.handle('hermes:getRequestsElevated', () => power.getPowerRequestsElevated(HELPER_PS1));
@@ -771,6 +696,7 @@ ipcMain.handle('hermes:setWslMemory', async (_event, gb, applyNow) => {
   const res = power.setWslConfigValue('memory', value);
   let restarted = false;
   if (applyNow) {
+    forgetDesiredGateways();
     await runPowerShell(`Stop-ScheduledTask -TaskName "${CONFIG.dashboardTaskName}"`, 10000).catch(() => {});
     await runWsl(`HERMES_HOME=${shellQuote(CONFIG.hermesHome)} ${shellQuote(CONFIG.hermesCommand)} gateway stop >/dev/null 2>&1 || true`, 12000).catch(() => {});
     await run(wslPath(), ['--shutdown'], 25000);
@@ -797,13 +723,31 @@ app.whenReady().then(() => {
     historyFile: path.join(app.getPath('userData'), 'mode-history.json')
   });
 
-  watchdog = createGatewayWatchdog({
-    listProfiles: () => adapter.listProfiles(),
+  lifecycle = createGatewayLifecycle({
     startProfile: (name) => adapter.gatewayStartProfile(name),
+    stopProfile: (name) => adapter.gatewayStopProfile(name),
+    listProfiles: () => adapter.listProfiles(),
+    probe: (name) => adapter.gatewayProcessStatus(name),
+    onChange: (entry) => sendToWindow('hermes:gatewayPhase', entry)
+  });
+
+  watchdog = createGatewayWatchdog({
+    // Background polls must not boot a stopped distro (`wsl -d` starts it),
+    // which undid "Stop Hermes" and reported every gateway as crashed.
+    listProfiles: async () => ((!stackHold && await service.isWslRunning())
+      ? adapter.listProfiles()
+      : { ok: false, profiles: [], error: 'WSL distro is not running' }),
+    // Auto-restart goes through the lifecycle so "restarted" means running.
+    startProfile: (name) => lifecycle.start(name),
+    isBusy: (name) => lifecycle.isBusy(name),
     getConfig: () => readSettings(),
     onEvent: (event) => sendToWindow('hermes:gatewayEvent', event),
-    onProfiles: (payload) => sendToWindow('hermes:profilesUpdated', payload),
-    notify: ({ title, body }) => new Notification({ title, body }).show()
+    onProfiles: (payload) => {
+      lifecycle.observe(payload.profiles);
+      sendToWindow('hermes:profilesUpdated', payload);
+    },
+    notify: ({ title, body }) => new Notification({ title, body }).show(),
+    pollMs: Number(process.env.HERMES_CONTROLLER_WATCHDOG_POLL_MS) || undefined
   });
 
   logStreamer = createLogStreamer({
