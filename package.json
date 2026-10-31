@@ -10,7 +10,9 @@
     "start": "electron .",
     "build": "vite build",
     "dist": "npm run build && electron-builder --win nsis portable",
-    "pack": "npm run build && electron-builder --dir"
+    "pack": "npm run build && electron-builder --dir",
+    "test": "node --test \"test/*.test.cjs\" \"test/*.test.mjs\"",
+    "test:e2e": "npm run build && xvfb-run -a node --test test/e2e/electron-flow.e2e.cjs"
   },
   "dependencies": {
     "lucide-react": "latest",
