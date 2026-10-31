@@ -1,0 +1,6 @@
+#!/bin/sh
+# Fake systemctl for the headless harness: user units are never active here.
+case "$*" in
+  *is-active*) echo inactive; exit 3 ;;
+  *) exit 0 ;;
+esac

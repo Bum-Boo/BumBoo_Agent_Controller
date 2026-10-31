@@ -1,0 +1,211 @@
+#!/usr/bin/env node
+// Fake `hermes` CLI used by the headless test harness. It runs *inside* the
+// fake WSL environment (see ../windows/System32/wsl.exe) and emulates only the
+// subset of the real CLI the controller calls:
+//
+//   hermes profile list | profile use <name>
+//   hermes [--profile <name>] gateway run [--replace] | gateway stop | gateway status
+//   hermes auth status openai-codex
+//   hermes --profile <name> config set <key> <value> | config check
+//
+// State lives under $HERMES_HOME (synthetic temp dir, never a real home):
+//   profiles/<name>/config.yaml           two-level YAML (model/agent sections)
+//   profiles/<name>/gateway.pid           written by `gateway run` once "up"
+//   profiles/<name>/gateway_state.json    { pid, platforms: { telegram: { state } } }
+//   profiles/<name>/fake-gateway.json     per-profile test behaviour (see below)
+//   profiles/<name>/logs/gateway.log
+//   active_profile                         sticky default profile
+//   fake-auth.json                         { loggedIn: boolean }
+//
+// fake-gateway.json:
+//   { "mode": "ok" | "crash-on-start" | "crash-after",
+//     "startDelayMs": 0,          // alive but not yet "running" (no pidfile)
+//     "crashAfterMs": 0,          // with mode crash-after
+//     "ignoreSigterm": false,     // `gateway stop` times out
+//     "stopWaitMs": 4000,         // how long `gateway stop` waits
+//     "configCheckFails": false,
+//     "platforms": { "telegram": "connected" } }
+
+const fs = require('node:fs');
+const path = require('node:path');
+
+const HOME = process.env.HERMES_HOME || path.join(process.env.HOME || '/tmp', '.hermes');
+const PROFILES = path.join(HOME, 'profiles');
+
+function profileDir(name) { return path.join(PROFILES, name); }
+function readJson(file, fallback) {
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return fallback; }
+}
+function behaviour(name) {
+  return { mode: 'ok', startDelayMs: 0, crashAfterMs: 0, ignoreSigterm: false, stopWaitMs: 4000, platforms: { telegram: 'connected' }, ...readJson(path.join(profileDir(name), 'fake-gateway.json'), {}) };
+}
+
+function parseYaml(text) {
+  const out = {};
+  let section = null;
+  for (const line of String(text).split(/\r?\n/)) {
+    if (!line.trim() || line.trim().startsWith('#')) continue;
+    const top = line.match(/^([A-Za-z0-9_]+):\s*(.*)$/);
+    const sub = line.match(/^\s+([A-Za-z0-9_]+):\s*(.*)$/);
+    if (top) {
+      section = top[1];
+      out[section] = top[2] ? unquote(top[2]) : {};
+    } else if (sub && section && typeof out[section] === 'object') {
+      out[section][sub[1]] = unquote(sub[2]);
+    }
+  }
+  return out;
+}
+function unquote(v) { return String(v).replace(/^['"]|['"]$/g, ''); }
+function dumpYaml(obj) {
+  const lines = [];
+  for (const [k, v] of Object.entries(obj)) {
+    if (v && typeof v === 'object') {
+      lines.push(`${k}:`);
+      for (const [sk, sv] of Object.entries(v)) lines.push(`  ${sk}: '${String(sv).replace(/'/g, "''")}'`);
+    } else lines.push(`${k}: '${String(v)}'`);
+  }
+  return `${lines.join('\n')}\n`;
+}
+function readConfig(name) {
+  try { return parseYaml(fs.readFileSync(path.join(profileDir(name), 'config.yaml'), 'utf8')); } catch { return {}; }
+}
+
+function alive(pid) {
+  if (!pid) return false;
+  try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
+}
+function pidOf(name) {
+  const raw = (() => { try { return fs.readFileSync(path.join(profileDir(name), 'gateway.pid'), 'utf8'); } catch { return ''; } })();
+  const pid = Number(raw.trim());
+  return Number.isInteger(pid) && pid > 0 ? pid : null;
+}
+function isRunning(name) { return alive(pidOf(name)); }
+function listNames() {
+  try { return fs.readdirSync(PROFILES).filter((n) => fs.statSync(profileDir(n)).isDirectory()).sort(); } catch { return []; }
+}
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+function profileList() {
+  const active = (() => { try { return fs.readFileSync(path.join(HOME, 'active_profile'), 'utf8').trim(); } catch { return ''; } })();
+  const rows = [['Profile', 'Model', 'Gateway', 'Alias']];
+  for (const name of listNames()) {
+    const model = (readConfig(name).model || {}).default || '—';
+    rows.push([`${name === active ? '◆' : ' '} ${name}`, model, isRunning(name) ? 'running' : 'stopped', '—']);
+  }
+  const widths = rows[0].map((_, i) => Math.max(...rows.map((r) => r[i].length)) + 3);
+  const fmt = (r) => ` ${r.map((c, i) => c.padEnd(widths[i])).join('')}`.trimEnd();
+  console.log(fmt(rows[0]));
+  console.log(` ${'─'.repeat(widths.reduce((a, b) => a + b, 0))}`);
+  for (const r of rows.slice(1)) console.log(fmt(r));
+}
+
+function log(name, line) {
+  const dir = path.join(profileDir(name), 'logs');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.appendFileSync(path.join(dir, 'gateway.log'), `${new Date().toISOString()} ${line}\n`);
+}
+
+function writeState(name, pid, platforms, running) {
+  const state = { pid, platforms: {} };
+  for (const [p, s] of Object.entries(platforms || {})) state.platforms[p] = { state: running ? s : 'disconnected' };
+  fs.writeFileSync(path.join(profileDir(name), 'gateway_state.json'), JSON.stringify(state));
+}
+
+async function gatewayRun(name, replace) {
+  if (!name || !fs.existsSync(profileDir(name))) { console.error(`profile not found: ${name}`); process.exit(2); }
+  const b = behaviour(name);
+  const old = pidOf(name);
+  if (alive(old) && old !== process.pid) {
+    if (!replace) { console.error('gateway already running'); process.exit(1); }
+    try { process.kill(old, 'SIGTERM'); } catch { /* gone */ }
+    for (let i = 0; i < 50 && alive(old); i += 1) await sleep(100);
+  }
+  console.log(`[fake-hermes] starting gateway for ${name}`);
+  log(name, 'INFO gateway starting');
+  if (b.startDelayMs) await sleep(b.startDelayMs);
+  if (b.mode === 'crash-on-start') {
+    console.error('ERROR fake startup failure: invalid bot token');
+    log(name, 'ERROR fake startup failure: invalid bot token');
+    process.exit(b.exitCode || 1);
+  }
+  fs.writeFileSync(path.join(profileDir(name), 'gateway.pid'), String(process.pid));
+  writeState(name, process.pid, b.platforms, true);
+  log(name, 'INFO gateway running');
+  console.log('[fake-hermes] gateway running');
+
+  const cleanup = (code) => {
+    if (pidOf(name) === process.pid) {
+      try { fs.unlinkSync(path.join(profileDir(name), 'gateway.pid')); } catch { /* ignore */ }
+      writeState(name, null, b.platforms, false);
+    }
+    log(name, `INFO gateway stopped (${code})`);
+    process.exit(code);
+  };
+  process.on('SIGTERM', () => { if (b.ignoreSigterm) { log(name, 'WARN ignoring SIGTERM'); return; } cleanup(0); });
+  process.on('SIGINT', () => cleanup(0));
+  process.on('SIGHUP', () => cleanup(0));
+  if (b.mode === 'crash-after') {
+    setTimeout(() => {
+      // A real crash leaves the stale pidfile behind; liveness must be checked.
+      log(name, 'ERROR Traceback: fake gateway crashed');
+      console.error('fake gateway crashed');
+      process.exit(b.exitCode || 1);
+    }, b.crashAfterMs || 500);
+  }
+  setInterval(() => {}, 1 << 30);
+}
+
+async function gatewayStop(name) {
+  if (!name) { console.error('--profile required'); process.exit(2); }
+  const pid = pidOf(name);
+  if (!alive(pid)) { console.log(`No gateway running for ${name}`); return; }
+  try { process.kill(pid, 'SIGTERM'); } catch { /* gone */ }
+  const deadline = Date.now() + behaviour(name).stopWaitMs;
+  while (Date.now() < deadline && alive(pid)) await sleep(100);
+  if (alive(pid)) { console.error(`Timed out stopping gateway ${pid}`); process.exit(1); }
+  console.log(`Gateway stopped (${pid})`);
+}
+
+function configSet(name, key, value) {
+  if (!name) { console.error('--profile required'); process.exit(2); }
+  const cfg = readConfig(name);
+  const [section, field] = String(key).split('.');
+  if (!field) { console.error(`bad key ${key}`); process.exit(2); }
+  cfg[section] = cfg[section] && typeof cfg[section] === 'object' ? cfg[section] : {};
+  cfg[section][field] = value;
+  fs.writeFileSync(path.join(profileDir(name), 'config.yaml'), dumpYaml(cfg));
+}
+
+async function main() {
+  const argv = process.argv.slice(2);
+  let profile = null;
+  const i = argv.indexOf('--profile');
+  if (i >= 0) { profile = argv[i + 1]; argv.splice(i, 2); }
+  const [cmd, sub, ...rest] = argv;
+
+  if (cmd === 'profile' && sub === 'list') return profileList();
+  if (cmd === 'profile' && sub === 'use') {
+    if (!fs.existsSync(profileDir(rest[0] || ''))) { console.error('no such profile'); process.exit(1); }
+    fs.writeFileSync(path.join(HOME, 'active_profile'), rest[0]);
+    return console.log(`Default profile: ${rest[0]}`);
+  }
+  if (cmd === 'gateway' && sub === 'run') return gatewayRun(profile, rest.includes('--replace'));
+  if (cmd === 'gateway' && sub === 'stop') return gatewayStop(profile);
+  if (cmd === 'gateway' && sub === 'status') {
+    return console.log(listNames().map((n) => `${n}: ${isRunning(n) ? 'running' : 'stopped'}`).join('\n'));
+  }
+  if (cmd === 'auth' && sub === 'status') {
+    const auth = readJson(path.join(HOME, 'fake-auth.json'), { loggedIn: true });
+    return console.log(auth.loggedIn ? `${rest[0] || 'openai-codex'}: Logged in` : `${rest[0] || 'openai-codex'}: not logged in`);
+  }
+  if (cmd === 'config' && sub === 'set') return configSet(profile, rest[0], rest[1] === undefined ? '' : rest[1]);
+  if (cmd === 'config' && sub === 'check') {
+    if (behaviour(profile).configCheckFails) { console.error('config invalid'); process.exit(1); }
+    return console.log('config ok');
+  }
+  console.error(`fake hermes: unsupported command: ${process.argv.slice(2).join(' ')}`);
+  process.exit(2);
+}
+
+main().catch((e) => { console.error(e && e.stack ? e.stack : String(e)); process.exit(1); });
